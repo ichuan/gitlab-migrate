@@ -34,8 +34,8 @@ class MigrationEngine:
             max_workers=config.migration.max_workers,
         )
 
-        # Initialize orchestrator
-        self.orchestrator = MigrationOrchestrator(self.context)
+        # Initialize orchestrator with git config
+        self.orchestrator = MigrationOrchestrator(self.context, self.config.git)
 
     async def migrate(self, plan: Optional[MigrationPlan] = None) -> MigrationSummary:
         """Execute migration with the given plan.

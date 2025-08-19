@@ -295,7 +295,12 @@ class TestAsyncMethods:
         mock_response = MagicMock()
         mock_response.status = 200
         mock_response.headers = {'Content-Type': 'application/json'}
-        mock_response.json = MagicMock(return_value={'id': 1, 'name': 'test'})
+
+        # Make json() method return a coroutine
+        async def mock_json():
+            return {'id': 1, 'name': 'test'}
+
+        mock_response.json = mock_json
         mock_response.content_length = 100
         mock_response.__aenter__.return_value = mock_response
         mock_response.__aexit__.return_value = None

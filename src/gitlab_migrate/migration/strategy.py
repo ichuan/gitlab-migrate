@@ -1,5 +1,8 @@
 """Migration strategy interfaces and implementations."""
 
+import time
+import random
+import string
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Type, TypeVar
@@ -441,6 +444,10 @@ class GroupMigrationStrategy(MigrationStrategy):
             if existing_group:
                 self.logger.info(f'Group {group.path} already exists in destination')
                 self.context.migrated_groups[group.id] = existing_group.id
+
+                # Still migrate members for existing groups
+                await self._migrate_group_members(group.id, existing_group.id)
+
                 return self.create_result(
                     entity_type='group',
                     entity_id=str(group.id),
@@ -453,13 +460,21 @@ class GroupMigrationStrategy(MigrationStrategy):
 
             if self.context.dry_run:
                 self.logger.info(f'Dry run: Would create group {group.path}')
+                # In dry run, also simulate member migration
+                members = await self._get_group_members(group.id)
                 return self.create_result(
                     entity_type='group',
                     entity_id=str(group.id),
                     status=MigrationStatus.COMPLETED,
                     success=True,
                     source_data=group.dict(),
-                    metadata={'dry_run': True},
+                    metadata={
+                        'dry_run': True,
+                        'members_to_migrate': len(members),
+                        'member_usernames': [
+                            m.get('username', 'unknown') for m in members
+                        ],
+                    },
                 )
 
             # Resolve parent group if needed
@@ -485,8 +500,13 @@ class GroupMigrationStrategy(MigrationStrategy):
                 new_group = Group(**new_group_data)
                 self.context.migrated_groups[group.id] = new_group.id
 
+                # Migrate group members after creating the group
+                members_migrated = await self._migrate_group_members(
+                    group.id, new_group.id
+                )
+
                 self.logger.info(
-                    f'Successfully migrated group {group.path} -> ID {new_group.id}'
+                    f'Successfully migrated group {group.path} -> ID {new_group.id} with {members_migrated} members'
                 )
                 return self.create_result(
                     entity_type='group',
@@ -495,6 +515,7 @@ class GroupMigrationStrategy(MigrationStrategy):
                     success=True,
                     source_data=group.dict(),
                     destination_data=new_group.dict(),
+                    metadata={'members_migrated': members_migrated},
                 )
             else:
                 error_msg = f'Failed to create group {group.path}: {response.data}'
@@ -569,6 +590,198 @@ class GroupMigrationStrategy(MigrationStrategy):
             self.logger.warning(f'Error searching for existing group {group.path}: {e}')
             return None
 
+    async def _get_group_members(self, source_group_id: int) -> List[Dict[str, Any]]:
+        """Get group members from source GitLab instance.
+
+        Args:
+            source_group_id: Source group ID
+
+        Returns:
+            List of group member data
+        """
+        try:
+            members_data = self.context.source_client.get_paginated(
+                f'/groups/{source_group_id}/members'
+            )
+            return list(members_data)
+        except Exception as e:
+            self.logger.warning(
+                f'Error fetching members for group {source_group_id}: {e}'
+            )
+            return []
+
+    async def _migrate_group_members(
+        self, source_group_id: int, destination_group_id: int
+    ) -> int:
+        """Migrate group members from source to destination.
+
+        Args:
+            source_group_id: Source group ID
+            destination_group_id: Destination group ID
+
+        Returns:
+            Number of members successfully migrated
+        """
+        members_migrated = 0
+
+        try:
+            # Get group members from source
+            source_members = await self._get_group_members(source_group_id)
+
+            if not source_members:
+                self.logger.info(f'No members found for group {source_group_id}')
+                return 0
+
+            self.logger.info(
+                f'Migrating {len(source_members)} members for group {source_group_id}'
+            )
+
+            for member_data in source_members:
+                try:
+                    source_user_id = member_data.get('id')
+                    access_level = member_data.get('access_level')
+                    expires_at = member_data.get('expires_at')
+
+                    if not source_user_id or not access_level:
+                        self.logger.warning(f'Invalid member data: {member_data}')
+                        continue
+
+                    # Check if user was migrated
+                    if source_user_id not in self.context.migrated_users:
+                        self.logger.warning(
+                            f'User {source_user_id} ({member_data.get("username", "unknown")}) '
+                            f'not found in migrated users, skipping group membership'
+                        )
+                        continue
+
+                    destination_user_id = self.context.migrated_users[source_user_id]
+
+                    # Check if user is already a member of the destination group
+                    if await self._is_user_group_member(
+                        destination_group_id, destination_user_id
+                    ):
+                        self.logger.info(
+                            f'User {destination_user_id} is already a member of group {destination_group_id}'
+                        )
+                        members_migrated += 1
+                        continue
+
+                    # Add user to destination group
+                    member_add_data = {
+                        'user_id': destination_user_id,
+                        'access_level': access_level,
+                    }
+
+                    if expires_at:
+                        member_add_data['expires_at'] = expires_at
+
+                    response = self.context.destination_client.post(
+                        f'/groups/{destination_group_id}/members', data=member_add_data
+                    )
+
+                    if response.success:
+                        members_migrated += 1
+                        self.logger.info(
+                            f'Added user {destination_user_id} ({member_data.get("username", "unknown")}) '
+                            f'to group {destination_group_id} with access level {access_level}'
+                        )
+                    else:
+                        self.logger.warning(
+                            f'Failed to add user {destination_user_id} to group {destination_group_id}: '
+                            f'{response.data}'
+                        )
+
+                except Exception as e:
+                    self.logger.error(
+                        f'Error migrating group member {member_data}: {e}'
+                    )
+                    continue
+
+        except Exception as e:
+            self.logger.error(
+                f'Error migrating members for group {source_group_id}: {e}'
+            )
+
+        return members_migrated
+
+    async def _is_user_group_member(self, group_id: int, user_id: int) -> bool:
+        """Check if user is already a member of the group.
+
+        Args:
+            group_id: Group ID
+            user_id: User ID
+
+        Returns:
+            True if user is already a member
+        """
+        try:
+            response = self.context.destination_client.get(
+                f'/groups/{group_id}/members/{user_id}'
+            )
+            return response.success
+        except Exception:
+            return False
+
+    async def _find_group_by_path(self, group_path: str) -> Optional[Group]:
+        """Find existing group in destination by full path.
+
+        Args:
+            group_path: Full group path to search for
+
+        Returns:
+            Existing group if found, None otherwise
+        """
+        try:
+            # Try to get group by full path
+            response = self.context.destination_client.get(f'/groups/{group_path}')
+            if response.success:
+                return Group(**response.data)
+
+            # If not found by direct path, try searching
+            response = self.context.destination_client.get(
+                '/groups', params={'search': group_path}
+            )
+            if response.success and response.data:
+                for group_data in response.data:
+                    if (
+                        group_data.get('full_path') == group_path
+                        or group_data.get('path') == group_path
+                    ):
+                        return Group(**group_data)
+
+            return None
+
+        except Exception as e:
+            self.logger.warning(f'Error searching for group by path {group_path}: {e}')
+            return None
+
+    async def _find_existing_user_by_username(self, username: str) -> Optional[User]:
+        """Find existing user in destination by username.
+
+        Args:
+            username: Username to search for
+
+        Returns:
+            Existing user if found, None otherwise
+        """
+        try:
+            # Search by username
+            response = self.context.destination_client.get(
+                '/users', params={'username': username}
+            )
+            if response.success and response.data:
+                for user_data in response.data:
+                    if user_data.get('username') == username:
+                        return User(**user_data)
+
+            return None
+
+        except Exception as e:
+            self.logger.warning(
+                f'Error searching for existing user by username {username}: {e}'
+            )
+            return None
+
 
 class ProjectMigrationStrategy(MigrationStrategy):
     """Strategy for migrating projects."""
@@ -616,10 +829,52 @@ class ProjectMigrationStrategy(MigrationStrategy):
             # Resolve namespace (group or user) with proper owner mapping
             namespace_id = await self._resolve_project_namespace(project)
 
-            # Create project in destination
+            # If namespace resolution fails, skip this project
+            if namespace_id is None and project.namespace:
+                error_msg = f'Cannot resolve namespace for project {project.path}. Namespace owner not migrated.'
+                self.logger.warning(error_msg)
+                return self.create_result(
+                    entity_type='project',
+                    entity_id=str(project.id),
+                    status=MigrationStatus.SKIPPED,
+                    success=True,  # Mark as success since we're intentionally skipping
+                    source_data=project.dict(),
+                    metadata={
+                        'reason': 'namespace_owner_not_migrated',
+                        'skip_reason': 'missing_namespace_owner',
+                    },
+                    warnings=[error_msg],
+                )
+
+            # Check if we need to generate a unique path to avoid disk conflicts
+            project_path = project.path
+            project_name = project.name
+
+            # Only generate unique path if there's a conflict
+            if await self._path_exists_in_destination(project.path, project.namespace):
+                self.logger.info(
+                    f'Project path {project.path} exists, generating unique path'
+                )
+                project_path = await self._generate_unique_project_path(project)
+
+                # If path was changed, also update the project name to match
+                if project_path != project.path:
+                    # Extract the suffix from the unique path
+                    suffix = (
+                        project_path[len(project.path) + 1 :]
+                        if len(project_path) > len(project.path)
+                        else project_path.split('-')[-1]
+                    )
+                    project_name = f'{project.name}-{suffix}'
+                    self.logger.info(
+                        f'Generated unique project name: {project.name} -> {project_name}'
+                    )
+            else:
+                self.logger.info(f'Using original project path: {project.path}')
+
             project_create = ProjectCreate(
-                name=project.name,
-                path=project.path,
+                name=project_name,
+                path=project_path,
                 namespace_id=namespace_id,
                 description=project.description,
                 visibility=project.visibility,
@@ -639,8 +894,16 @@ class ProjectMigrationStrategy(MigrationStrategy):
                 new_project = Project(**new_project_data)
                 self.context.migrated_projects[project.id] = new_project.id
 
+                # Migrate project members after creating the project
+                members_migrated = await self._migrate_project_members(
+                    project.id, new_project.id
+                )
+
+                # Set the correct owner if different from namespace owner
+                await self._set_project_owner(project, new_project.id)
+
                 self.logger.info(
-                    f'Successfully migrated project {project.path} -> ID {new_project.id}'
+                    f'Successfully migrated project {project.path} -> ID {new_project.id} with {members_migrated} members'
                 )
                 return self.create_result(
                     entity_type='project',
@@ -649,6 +912,7 @@ class ProjectMigrationStrategy(MigrationStrategy):
                     success=True,
                     source_data=project.dict(),
                     destination_data=new_project.dict(),
+                    metadata={'members_migrated': members_migrated},
                 )
             else:
                 # Check for repository disk conflict error
@@ -784,16 +1048,48 @@ class ProjectMigrationStrategy(MigrationStrategy):
             namespace_data = project.namespace
             namespace_kind = namespace_data.get('kind', 'user')
             source_namespace_id = namespace_data.get('id')
+            namespace_path = namespace_data.get('path', '')
+            namespace_full_path = namespace_data.get('full_path', namespace_path)
+
+            self.logger.info(
+                f'Resolving namespace for project {project.path}: '
+                f'kind={namespace_kind}, id={source_namespace_id}, '
+                f'path={namespace_path}, full_path={namespace_full_path}'
+            )
 
             if namespace_kind == 'group':
                 # Handle group projects - use existing group mapping logic
                 if source_namespace_id in self.context.migrated_groups:
-                    return self.context.migrated_groups[source_namespace_id]
-                else:
-                    self.logger.warning(
-                        f'Group namespace {source_namespace_id} not found in migrated groups for project {project.path}'
+                    destination_group_id = self.context.migrated_groups[
+                        source_namespace_id
+                    ]
+                    self.logger.info(
+                        f'Found migrated group mapping: {source_namespace_id} -> {destination_group_id}'
                     )
-                    return None
+                    return destination_group_id
+                else:
+                    # Try to find the group by path in destination
+                    destination_group = await self._find_group_by_path(
+                        namespace_full_path
+                    )
+                    if destination_group:
+                        self.logger.info(
+                            f'Found existing group by path: {namespace_full_path} -> {destination_group.id}'
+                        )
+                        # Update the mapping for future use
+                        if (
+                            destination_group.id is not None
+                            and source_namespace_id is not None
+                        ):
+                            self.context.migrated_groups[source_namespace_id] = (
+                                destination_group.id
+                            )
+                        return destination_group.id
+                    else:
+                        self.logger.warning(
+                            f'Group namespace {source_namespace_id} ({namespace_full_path}) not found in migrated groups for project {project.path}'
+                        )
+                        return None
             else:
                 # Handle user-owned projects - map to migrated user
                 if source_namespace_id in self.context.migrated_users:
@@ -816,10 +1112,43 @@ class ProjectMigrationStrategy(MigrationStrategy):
                         )
                         return None
                 else:
-                    self.logger.warning(
-                        f'User namespace {source_namespace_id} not found in migrated users for project {project.path}'
+                    # User not in migrated_users - try to find existing user in destination by username
+                    self.logger.info(
+                        f'User namespace {source_namespace_id} not found in migrated users, searching for existing user by path: {namespace_path}'
                     )
-                    return None
+
+                    existing_user = await self._find_existing_user_by_username(
+                        namespace_path
+                    )
+                    if existing_user:
+                        self.logger.info(
+                            f'Found existing user {namespace_path} in destination with ID {existing_user.id}'
+                        )
+                        # Update the mapping for future use - ensure source_namespace_id is not None
+                        if source_namespace_id is not None:
+                            self.context.migrated_users[source_namespace_id] = (
+                                existing_user.id
+                            )
+
+                        # Get the user's namespace ID in destination
+                        user_namespace_id = await self._get_user_namespace_id(
+                            existing_user.id
+                        )
+                        if user_namespace_id:
+                            self.logger.info(
+                                f'Mapped user-owned project {project.path} to existing user namespace {user_namespace_id}'
+                            )
+                            return user_namespace_id
+                        else:
+                            self.logger.warning(
+                                f'Could not find namespace for existing user {existing_user.id} for project {project.path}'
+                            )
+                            return None
+                    else:
+                        self.logger.warning(
+                            f'User namespace {source_namespace_id} ({namespace_path}) not found in migrated users and does not exist in destination for project {project.path}'
+                        )
+                        return None
 
         except Exception as e:
             self.logger.error(
@@ -861,9 +1190,30 @@ class ProjectMigrationStrategy(MigrationStrategy):
             True if this is a repository disk conflict error
         """
         try:
+            # Handle different error data formats
             error_str = str(error_data).lower()
 
-            # Check for common disk conflict error patterns
+            # Handle structured error responses (dict format)
+            if isinstance(error_data, dict):
+                # Check for base errors
+                if 'base' in error_data and isinstance(error_data['base'], list):
+                    for error_msg in error_data['base']:
+                        if 'repository' in str(error_msg).lower() and (
+                            'disk' in str(error_msg).lower()
+                            or 'already' in str(error_msg).lower()
+                        ):
+                            return True
+
+                # Check for path errors
+                if 'path' in error_data and isinstance(error_data['path'], list):
+                    for error_msg in error_data['path']:
+                        if (
+                            'taken' in str(error_msg).lower()
+                            or 'already' in str(error_msg).lower()
+                        ):
+                            return True
+
+            # Check for common disk conflict error patterns in string format
             disk_conflict_patterns = [
                 'there is already a repository with that name on disk',
                 'repository with that name on disk',
@@ -871,6 +1221,13 @@ class ProjectMigrationStrategy(MigrationStrategy):
                 'repository already exists on disk',
                 'disk conflict',
                 'repository path conflict',
+                'path has already been taken',
+                'has already been taken',
+                'repository storage path',
+                'storage path conflict',
+                'name can contain only',
+                'name is too long',
+                'invalid path',
             ]
 
             return any(pattern in error_str for pattern in disk_conflict_patterns)
@@ -878,23 +1235,494 @@ class ProjectMigrationStrategy(MigrationStrategy):
         except Exception:
             return False
 
+    async def _get_project_members(
+        self, source_project_id: int
+    ) -> List[Dict[str, Any]]:
+        """Get project members from source GitLab instance.
+
+        Args:
+            source_project_id: Source project ID
+
+        Returns:
+            List of project member data
+        """
+        try:
+            members_data = self.context.source_client.get_paginated(
+                f'/projects/{source_project_id}/members'
+            )
+            return list(members_data)
+        except Exception as e:
+            self.logger.warning(
+                f'Error fetching members for project {source_project_id}: {e}'
+            )
+            return []
+
+    async def _migrate_project_members(
+        self, source_project_id: int, destination_project_id: int
+    ) -> int:
+        """Migrate project members from source to destination.
+
+        Args:
+            source_project_id: Source project ID
+            destination_project_id: Destination project ID
+
+        Returns:
+            Number of members successfully migrated
+        """
+        members_migrated = 0
+
+        try:
+            # Get project members from source
+            source_members = await self._get_project_members(source_project_id)
+
+            if not source_members:
+                self.logger.info(f'No members found for project {source_project_id}')
+                return 0
+
+            self.logger.info(
+                f'Migrating {len(source_members)} members for project {source_project_id}'
+            )
+
+            for member_data in source_members:
+                try:
+                    source_user_id = member_data.get('id')
+                    access_level = member_data.get('access_level')
+                    expires_at = member_data.get('expires_at')
+
+                    if not source_user_id or not access_level:
+                        self.logger.warning(f'Invalid member data: {member_data}')
+                        continue
+
+                    # Check if user was migrated
+                    if source_user_id not in self.context.migrated_users:
+                        self.logger.warning(
+                            f'User {source_user_id} ({member_data.get("username", "unknown")}) '
+                            f'not found in migrated users, skipping project membership'
+                        )
+                        continue
+
+                    destination_user_id = self.context.migrated_users[source_user_id]
+
+                    # Check if user is already a member of the destination project
+                    member_info = await self._get_user_project_member_info(
+                        destination_project_id, destination_user_id
+                    )
+                    if member_info:
+                        current_access_level = member_info.get('access_level', 0)
+                        source_access_level = access_level
+
+                        # Check if user has inherited permissions that are higher or equal
+                        if member_info.get('created_at') and member_info.get(
+                            'created_by'
+                        ):
+                            # This is an inherited membership, check if we need to update
+                            self.logger.info(
+                                f'User {destination_user_id} has inherited membership in project {destination_project_id} '
+                                f'with access level {current_access_level}'
+                            )
+
+                            # Only attempt to update if the source access level is higher
+                            if source_access_level > current_access_level:
+                                # Try to update the access level
+                                update_response = self.context.destination_client.put(
+                                    f'/projects/{destination_project_id}/members/{destination_user_id}',
+                                    data={'access_level': source_access_level},
+                                )
+
+                                if update_response.success:
+                                    members_migrated += 1
+                                    self.logger.info(
+                                        f'Updated user {destination_user_id} access level from {current_access_level} to {source_access_level} '
+                                        f'in project {destination_project_id}'
+                                    )
+                                else:
+                                    self.logger.warning(
+                                        f'Failed to update user {destination_user_id} access level in project {destination_project_id}: '
+                                        f'{update_response.data}'
+                                    )
+                            else:
+                                self.logger.info(
+                                    f'User {destination_user_id} already has sufficient access level ({current_access_level}) '
+                                    f'in project {destination_project_id}, skipping update'
+                                )
+                                members_migrated += 1
+                        else:
+                            self.logger.info(
+                                f'User {destination_user_id} is already a member of project {destination_project_id} '
+                                f'with access level {current_access_level}'
+                            )
+                            members_migrated += 1
+                        continue
+
+                    # Add user to destination project
+                    member_add_data = {
+                        'user_id': destination_user_id,
+                        'access_level': access_level,
+                    }
+
+                    if expires_at:
+                        member_add_data['expires_at'] = expires_at
+
+                    response = self.context.destination_client.post(
+                        f'/projects/{destination_project_id}/members',
+                        data=member_add_data,
+                    )
+
+                    if response.success:
+                        members_migrated += 1
+                        self.logger.info(
+                            f'Added user {destination_user_id} ({member_data.get("username", "unknown")}) '
+                            f'to project {destination_project_id} with access level {access_level}'
+                        )
+                    else:
+                        # Handle specific case of inherited permissions
+                        error_data = response.data
+                        if (
+                            isinstance(error_data, dict)
+                            and 'access_level' in error_data
+                        ):
+                            error_messages = error_data.get('access_level', [])
+                            if any(
+                                'greater than or equal to Maintainer inherited membership'
+                                in str(msg)
+                                for msg in error_messages
+                            ):
+                                self.logger.warning(
+                                    f'User {destination_user_id} has inherited permissions that prevent setting access level {access_level}. '
+                                    f'This is expected behavior when user has higher inherited permissions.'
+                                )
+                                members_migrated += 1  # Count as migrated since it's handled by inheritance
+                                continue
+
+                        self.logger.warning(
+                            f'Failed to add user {destination_user_id} to project {destination_project_id}: '
+                            f'{response.data}'
+                        )
+
+                except Exception as e:
+                    self.logger.error(
+                        f'Error migrating project member {member_data}: {e}'
+                    )
+                    continue
+
+        except Exception as e:
+            self.logger.error(
+                f'Error migrating members for project {source_project_id}: {e}'
+            )
+
+        return members_migrated
+
+    async def _is_user_project_member(self, project_id: int, user_id: int) -> bool:
+        """Check if user is already a member of the project.
+
+        Args:
+            project_id: Project ID
+            user_id: User ID
+
+        Returns:
+            True if user is already a member
+        """
+        try:
+            response = self.context.destination_client.get(
+                f'/projects/{project_id}/members/{user_id}'
+            )
+            return response.success
+        except Exception:
+            return False
+
+    async def _get_user_project_member_info(
+        self, project_id: int, user_id: int
+    ) -> Optional[Dict[str, Any]]:
+        """Get detailed information about a user's project membership.
+
+        Args:
+            project_id: Project ID
+            user_id: User ID
+
+        Returns:
+            Member information if user is a member, None otherwise
+        """
+        try:
+            response = self.context.destination_client.get(
+                f'/projects/{project_id}/members/{user_id}'
+            )
+            if response.success:
+                return response.data
+            return None
+        except Exception:
+            return None
+
+    async def _set_project_owner(
+        self, source_project: Project, destination_project_id: int
+    ) -> None:
+        """Set the correct project owner based on source project information.
+
+        Args:
+            source_project: Source project data
+            destination_project_id: Destination project ID
+        """
+        try:
+            # Get the source project's owner information
+            source_owner_id = None
+
+            # Check for creator_id field
+            if source_project.creator_id:
+                source_owner_id = source_project.creator_id
+            # Check for owner in namespace (for user-owned projects)
+            elif (
+                source_project.namespace
+                and source_project.namespace.get('kind') == 'user'
+            ):
+                source_owner_id = source_project.namespace.get('id')
+
+            if not source_owner_id:
+                self.logger.debug(
+                    f'No specific owner found for project {source_project.path}'
+                )
+                return
+
+            # Check if the owner was migrated
+            if source_owner_id not in self.context.migrated_users:
+                self.logger.warning(
+                    f'Project owner {source_owner_id} not found in migrated users for project {source_project.path}'
+                )
+                return
+
+            destination_owner_id = self.context.migrated_users[source_owner_id]
+
+            # Try to set the project owner by adding them as owner if not already
+            try:
+                # First check if they're already an owner
+                response = self.context.destination_client.get(
+                    f'/projects/{destination_project_id}/members/{destination_owner_id}'
+                )
+
+                if response.success:
+                    current_access_level = response.data.get('access_level', 0)
+                    if current_access_level >= 50:  # Already owner (50) or higher
+                        self.logger.info(
+                            f'User {destination_owner_id} is already owner of project {destination_project_id}'
+                        )
+                        return
+                    else:
+                        # Update access level to owner
+                        update_response = self.context.destination_client.put(
+                            f'/projects/{destination_project_id}/members/{destination_owner_id}',
+                            data={'access_level': 50},
+                        )
+                        if update_response.success:
+                            self.logger.info(
+                                f'Updated user {destination_owner_id} to owner of project {destination_project_id}'
+                            )
+                        else:
+                            self.logger.warning(
+                                f'Failed to update user {destination_owner_id} to owner: {update_response.data}'
+                            )
+                else:
+                    # Add as owner
+                    add_response = self.context.destination_client.post(
+                        f'/projects/{destination_project_id}/members',
+                        data={'user_id': destination_owner_id, 'access_level': 50},
+                    )
+                    if add_response.success:
+                        self.logger.info(
+                            f'Added user {destination_owner_id} as owner of project {destination_project_id}'
+                        )
+                    else:
+                        self.logger.warning(
+                            f'Failed to add user {destination_owner_id} as owner: {add_response.data}'
+                        )
+
+            except Exception as e:
+                self.logger.warning(f'Error setting project owner: {e}')
+
+        except Exception as e:
+            self.logger.error(f'Error in _set_project_owner: {e}')
+
+    async def _generate_unique_project_path(self, project: Project) -> str:
+        """Generate a unique project path to avoid repository disk conflicts.
+
+        Only generates a unique path when necessary to avoid disk conflicts.
+
+        Args:
+            project: Source project
+
+        Returns:
+            Project path (potentially unique) for destination
+        """
+        try:
+            original_path = project.path
+
+            # First check if the original path already exists
+            if not await self._path_exists_in_destination(
+                original_path, project.namespace
+            ):
+                # Path doesn't exist, use original path
+                self.logger.info(
+                    f'Using original project path (no conflict): {original_path}'
+                )
+                return original_path
+
+            # Path exists, generate a unique suffix to avoid disk conflicts
+            # GitLab disk conflicts can happen even when projects don't exist in API
+            max_attempts = 10
+            for attempt in range(max_attempts):
+                timestamp = int(time.time() % 10000)  # Last 4 digits of timestamp
+                random_suffix = ''.join(random.choices(string.ascii_lowercase, k=4))
+                unique_suffix = f'{timestamp}{random_suffix}'
+                unique_path = f'{original_path}-{unique_suffix}'
+
+                # Check if the generated unique path also exists (should be rare but possible)
+                if not await self._path_exists_in_destination(
+                    unique_path, project.namespace
+                ):
+                    self.logger.info(
+                        f'Generated unique project path to avoid disk conflicts: {original_path} -> {unique_path}'
+                    )
+                    return unique_path
+
+            # If we couldn't generate a unique path after max attempts, use timestamp + attempt
+            timestamp_full = int(time.time())
+            fallback_path = f'{original_path}-{timestamp_full}'
+            self.logger.warning(
+                f'Using fallback unique path after {max_attempts} attempts: {original_path} -> {fallback_path}'
+            )
+            return fallback_path
+
+        except Exception as e:
+            self.logger.error(
+                f'CRITICAL ERROR: Failed to generate unique project path for {project.path}: {e}'
+            )
+            # Fallback to timestamp-based path
+            timestamp = int(time.time())
+            fallback_path = f'{project.path}-{timestamp}'
+            return fallback_path
+
+    async def _path_exists_in_destination(
+        self, path: str, namespace: Optional[Dict[str, Any]]
+    ) -> bool:
+        """Check if a project path already exists in the destination.
+
+        Args:
+            path: Project path to check
+            namespace: Project namespace information
+
+        Returns:
+            True if path exists, False otherwise
+        """
+        try:
+            # Try to find project by full path (namespace/project)
+            if namespace and namespace.get('path'):
+                full_path = f'{namespace["path"]}/{path}'
+                response = self.context.destination_client.get(
+                    f'/projects/{full_path.replace("/", "%2F")}'
+                )
+                if response.success:
+                    self.logger.debug(
+                        f'Found existing project by full path: {full_path}'
+                    )
+                    return True
+
+            # Search by project path only
+            response = self.context.destination_client.get(
+                '/projects', params={'search': path}
+            )
+            if response.success and response.data:
+                for project_data in response.data:
+                    if project_data.get('path') == path:
+                        self.logger.debug(
+                            f'Found existing project by path search: {path}'
+                        )
+                        return True
+
+            self.logger.debug(f'Project path does not exist in destination: {path}')
+            return False
+
+        except Exception as e:
+            self.logger.warning(f'Error checking if path {path} exists: {e}')
+            # If we can't check, assume it doesn't exist to avoid blocking migration
+            return False
+
+    async def _find_group_by_path(self, group_path: str) -> Optional[Group]:
+        """Find existing group in destination by full path.
+
+        Args:
+            group_path: Full group path to search for
+
+        Returns:
+            Existing group if found, None otherwise
+        """
+        try:
+            # Try to get group by full path
+            response = self.context.destination_client.get(f'/groups/{group_path}')
+            if response.success:
+                return Group(**response.data)
+
+            # If not found by direct path, try searching
+            response = self.context.destination_client.get(
+                '/groups', params={'search': group_path}
+            )
+            if response.success and response.data:
+                for group_data in response.data:
+                    if (
+                        group_data.get('full_path') == group_path
+                        or group_data.get('path') == group_path
+                    ):
+                        return Group(**group_data)
+
+            return None
+
+        except Exception as e:
+            self.logger.warning(f'Error searching for group by path {group_path}: {e}')
+            return None
+
+    async def _find_existing_user_by_username(self, username: str) -> Optional[User]:
+        """Find existing user in destination by username.
+
+        Args:
+            username: Username to search for
+
+        Returns:
+            Existing user if found, None otherwise
+        """
+        try:
+            # Search by username
+            response = self.context.destination_client.get(
+                '/users', params={'username': username}
+            )
+            if response.success and response.data:
+                for user_data in response.data:
+                    if user_data.get('username') == username:
+                        return User(**user_data)
+
+            return None
+
+        except Exception as e:
+            self.logger.warning(
+                f'Error searching for existing user by username {username}: {e}'
+            )
+            return None
+
 
 class RepositoryMigrationStrategy(MigrationStrategy):
     """Strategy for migrating repositories."""
 
-    def __init__(self, context: MigrationContext):
+    def __init__(self, context: MigrationContext, git_config=None):
         """Initialize repository migration strategy.
 
         Args:
             context: Migration context with clients and settings
+            git_config: Git configuration (optional, will use defaults if not provided)
         """
         super().__init__(context)
 
         # Import here to avoid circular imports
-        from ..git.operations import GitOperations, GitConfig
+        from ..git.operations import GitOperations
+        from ..config.config import GitConfig
 
-        # Initialize Git operations
-        git_config = GitConfig(lfs_enabled=True, cleanup_temp=True, git_timeout=3600)
+        # Use provided git_config or create default one
+        if git_config is None:
+            git_config = GitConfig(lfs_enabled=True, cleanup_temp=True, timeout=3600)
 
         self.git_operations = GitOperations(
             source_client=context.source_client,

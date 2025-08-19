@@ -136,10 +136,13 @@ class GitPusher:
             True if successful, False otherwise
         """
         try:
-            repo_git_path = os.path.join(repository_path, 'repo.git')
+            # Find the actual git repository directory (now has dynamic name)
+            repo_git_path = self._find_git_repo_path(repository_path)
 
-            if not os.path.exists(repo_git_path):
-                self.logger.error(f'Repository path does not exist: {repo_git_path}')
+            if not repo_git_path or not os.path.exists(repo_git_path):
+                self.logger.error(
+                    f'Repository path does not exist in: {repository_path}'
+                )
                 return False
 
             # Configure git for the operation
@@ -156,7 +159,7 @@ class GitPusher:
             if not push_success:
                 return False
 
-            self.logger.info('Git push completed successfully')
+            self.logger.info(f'Git push completed successfully from {repo_git_path}')
             return True
 
         except Exception as e:
@@ -265,7 +268,7 @@ class GitPusher:
             )
 
             stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=self.config.git_timeout
+                process.communicate(), timeout=self.config.timeout
             )
 
             if process.returncode == 0:
@@ -276,13 +279,36 @@ class GitPusher:
                 return False
 
         except asyncio.TimeoutError:
-            self.logger.error(
-                f'Git push timed out after {self.config.git_timeout} seconds'
-            )
+            self.logger.error(f'Git push timed out after {self.config.timeout} seconds')
             return False
         except Exception as e:
             self.logger.error(f'Git push execution failed: {e}')
             return False
+
+    def _find_git_repo_path(self, base_path: str) -> Optional[str]:
+        """Find the git repository directory within the base path.
+
+        Args:
+            base_path: Base directory to search in
+
+        Returns:
+            Path to git repository directory, or None if not found
+        """
+        try:
+            if not os.path.exists(base_path):
+                return None
+
+            # Look for directories ending with .git
+            for item in os.listdir(base_path):
+                item_path = os.path.join(base_path, item)
+                if os.path.isdir(item_path) and item.endswith('.git'):
+                    return item_path
+
+            return None
+
+        except Exception as e:
+            self.logger.warning(f'Error finding git repo path in {base_path}: {e}')
+            return None
 
     async def _get_push_stats(self, repo_path: str) -> dict:
         """Get push statistics.
@@ -296,9 +322,10 @@ class GitPusher:
         stats = {'branches': 0, 'tags': 0}
 
         try:
-            repo_git_path = os.path.join(repo_path, 'repo.git')
+            # Find the actual git repository directory (now has dynamic name)
+            repo_git_path = self._find_git_repo_path(repo_path)
 
-            if not os.path.exists(repo_git_path):
+            if not repo_git_path or not os.path.exists(repo_git_path):
                 return stats
 
             # Get branch count

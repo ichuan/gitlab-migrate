@@ -77,13 +77,15 @@ class MigrationSummary(BaseModel):
 class MigrationOrchestrator:
     """Orchestrates the migration of entities between GitLab instances."""
 
-    def __init__(self, context: MigrationContext):
+    def __init__(self, context: MigrationContext, git_config=None):
         """Initialize migration orchestrator.
 
         Args:
             context: Migration context with clients and settings
+            git_config: Git configuration for repository operations
         """
         self.context = context
+        self.git_config = git_config
         self.logger = logger.bind(component='MigrationOrchestrator')
 
         # Initialize strategies
@@ -91,7 +93,7 @@ class MigrationOrchestrator:
             'users': UserMigrationStrategy(context),
             'groups': GroupMigrationStrategy(context),
             'projects': ProjectMigrationStrategy(context),
-            'repositories': RepositoryMigrationStrategy(context),
+            'repositories': RepositoryMigrationStrategy(context, git_config),
         }
 
     async def execute_migration(self, plan: MigrationPlan) -> MigrationSummary:
@@ -383,8 +385,12 @@ class MigrationOrchestrator:
                         error_message=f'Batch processing failed: {result}',
                     )
                     all_results.append(failure_result)
-            else:
+            elif isinstance(result, list):
                 all_results.extend(result)
+            else:
+                self.logger.warning(
+                    f'Unexpected result type from batch {i}: {type(result)}'
+                )
 
         return all_results
 

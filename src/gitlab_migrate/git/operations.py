@@ -15,19 +15,7 @@ from .push import GitPusher
 from .lfs import LFSHandler
 from ..models.repository import Repository, RepositoryMigrationResult
 from ..api.client import GitLabClient
-
-
-@dataclass
-class GitConfig:
-    """Git configuration for operations."""
-
-    user_name: str = 'GitLab Migration Tool'
-    user_email: str = 'migration@gitlab.local'
-    temp_dir: Optional[str] = None
-    cleanup_temp: bool = True
-    git_timeout: int = 3600  # 1 hour timeout for git operations
-    lfs_enabled: bool = True
-    preserve_lfs: bool = True
+from ..config.config import GitConfig
 
 
 class GitOperations:
@@ -37,7 +25,7 @@ class GitOperations:
         self,
         source_client: GitLabClient,
         destination_client: GitLabClient,
-        config: Optional[GitConfig] = None,
+        config: GitConfig,
     ):
         """Initialize Git operations.
 
@@ -48,7 +36,7 @@ class GitOperations:
         """
         self.source_client = source_client
         self.destination_client = destination_client
-        self.config = config or GitConfig()
+        self.config = config
 
         self.cloner = GitCloner(source_client, self.config)
         self.pusher = GitPusher(destination_client, self.config)

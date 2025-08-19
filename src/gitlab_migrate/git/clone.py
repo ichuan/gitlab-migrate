@@ -138,6 +138,25 @@ class GitCloner:
             # Ensure destination directory exists
             os.makedirs(destination_path, exist_ok=True)
 
+            # Generate unique repository directory name using timestamp and random suffix
+            import time
+            import random
+            import string
+
+            timestamp = int(time.time() * 1000)  # milliseconds for uniqueness
+            random_suffix = ''.join(
+                random.choices(string.ascii_lowercase + string.digits, k=6)
+            )
+            repo_dir_name = f'repo_{timestamp}_{random_suffix}.git'
+            repo_path = os.path.join(destination_path, repo_dir_name)
+
+            # Double-check that the path doesn't exist (extremely unlikely but safe)
+            if os.path.exists(repo_path):
+                self.logger.warning(
+                    f'Repository path {repo_path} already exists, cleaning up...'
+                )
+                await self._cleanup_existing_repository(repo_path)
+
             # Configure git for the operation
             await self._configure_git(destination_path)
 
@@ -147,7 +166,7 @@ class GitCloner:
                 'clone',
                 '--mirror',
                 clone_url,
-                os.path.join(destination_path, 'repo.git'),
+                repo_path,
             ]
 
             process = await asyncio.create_subprocess_exec(
@@ -158,20 +177,28 @@ class GitCloner:
             )
 
             stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=self.config.git_timeout
+                process.communicate(), timeout=self.config.timeout
             )
 
             if process.returncode == 0:
-                self.logger.info('Git clone completed successfully')
+                self.logger.info(f'Git clone completed successfully to {repo_path}')
                 return True
             else:
                 error_output = stderr.decode() if stderr else 'Unknown error'
                 self.logger.error(f'Git clone failed: {error_output}')
+
+                # Check if it's the "already exists" error and provide helpful message
+                if 'already exists' in error_output.lower():
+                    self.logger.error(
+                        f'Repository already exists at {repo_path}. This might indicate a cleanup issue. '
+                        'Consider using a different temp_dir or ensuring proper cleanup.'
+                    )
+
                 return False
 
         except asyncio.TimeoutError:
             self.logger.error(
-                f'Git clone timed out after {self.config.git_timeout} seconds'
+                f'Git clone timed out after {self.config.timeout} seconds'
             )
             return False
         except Exception as e:
@@ -240,9 +267,10 @@ class GitCloner:
         stats = {'size': 0, 'branches': 0, 'tags': 0, 'commits': 0}
 
         try:
-            repo_git_path = os.path.join(repo_path, 'repo.git')
+            # Find the actual git repository directory (now has dynamic name)
+            repo_git_path = self._find_git_repo_path(repo_path)
 
-            if not os.path.exists(repo_git_path):
+            if not repo_git_path or not os.path.exists(repo_git_path):
                 return stats
 
             # Get repository size
@@ -277,6 +305,31 @@ class GitCloner:
             self.logger.warning(f'Failed to get repository stats: {e}')
 
         return stats
+
+    def _find_git_repo_path(self, base_path: str) -> Optional[str]:
+        """Find the git repository directory within the base path.
+
+        Args:
+            base_path: Base directory to search in
+
+        Returns:
+            Path to git repository directory, or None if not found
+        """
+        try:
+            if not os.path.exists(base_path):
+                return None
+
+            # Look for directories ending with .git
+            for item in os.listdir(base_path):
+                item_path = os.path.join(base_path, item)
+                if os.path.isdir(item_path) and item.endswith('.git'):
+                    return item_path
+
+            return None
+
+        except Exception as e:
+            self.logger.warning(f'Error finding git repo path in {base_path}: {e}')
+            return None
 
     async def _get_directory_size(self, path: str) -> int:
         """Get total size of directory in bytes.
@@ -328,3 +381,23 @@ class GitCloner:
 
         except Exception:
             return None
+
+    async def _cleanup_existing_repository(self, repo_path: str) -> None:
+        """Clean up existing repository directory.
+
+        Args:
+            repo_path: Path to existing repository directory
+        """
+        try:
+            import shutil
+
+            if os.path.exists(repo_path):
+                # Remove the existing repository directory
+                shutil.rmtree(repo_path)
+                self.logger.info(f'Cleaned up existing repository at {repo_path}')
+        except Exception as e:
+            self.logger.warning(
+                f'Failed to cleanup existing repository {repo_path}: {e}'
+            )
+            # Re-raise the exception so the caller knows cleanup failed
+            raise

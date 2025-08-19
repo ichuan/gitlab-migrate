@@ -80,6 +80,54 @@ class MigrationConfig(BaseModel):
         return v
 
 
+class GitConfig(BaseModel):
+    """Git operations configuration."""
+
+    temp_dir: Optional[str] = Field(
+        default=None,
+        description='Custom temporary directory for git operations. If not specified, uses system temp directory.',
+    )
+    user_name: str = Field(
+        default='GitLab Migration Tool', description='Git user name for commits'
+    )
+    user_email: str = Field(
+        default='migration@gitlab.local', description='Git user email for commits'
+    )
+    timeout: int = Field(
+        default=3600, description='Git operation timeout in seconds (default: 1 hour)'
+    )
+    cleanup_temp: bool = Field(
+        default=True,
+        description='Whether to cleanup temporary directories after migration',
+    )
+    lfs_enabled: bool = Field(
+        default=True, description='Enable Git LFS support for large files'
+    )
+    preserve_lfs: bool = Field(
+        default=True, description='Preserve LFS objects during migration'
+    )
+
+    @validator('temp_dir')
+    def validate_temp_dir(cls, v):
+        """Validate temp directory path."""
+        if v is not None:
+            temp_path = Path(v)
+            if not temp_path.is_absolute():
+                raise ValueError('temp_dir must be an absolute path')
+            # Create directory if it doesn't exist
+            temp_path.mkdir(parents=True, exist_ok=True)
+            if not temp_path.is_dir():
+                raise ValueError(f'temp_dir path is not a directory: {v}')
+        return v
+
+    @validator('timeout')
+    def validate_timeout(cls, v):
+        """Validate timeout is positive."""
+        if v <= 0:
+            raise ValueError('Git timeout must be positive')
+        return v
+
+
 class LoggingConfig(BaseModel):
     """Logging configuration."""
 
@@ -108,6 +156,9 @@ class Config(BaseModel):
     )
     migration: MigrationConfig = Field(
         default_factory=MigrationConfig, description='Migration settings'
+    )
+    git: GitConfig = Field(
+        default_factory=GitConfig, description='Git operations settings'
     )
     logging: LoggingConfig = Field(
         default_factory=LoggingConfig, description='Logging settings'
@@ -150,6 +201,15 @@ class Config(BaseModel):
                 'batch_size': int(os.getenv('MIGRATION_BATCH_SIZE', 50)),
                 'max_workers': int(os.getenv('MIGRATION_MAX_WORKERS', 5)),
                 'timeout': int(os.getenv('MIGRATION_TIMEOUT', 300)),
+            },
+            'git': {
+                'temp_dir': os.getenv('GIT_TEMP_DIR'),
+                'user_name': os.getenv('GIT_USER_NAME', 'GitLab Migration Tool'),
+                'user_email': os.getenv('GIT_USER_EMAIL', 'migration@gitlab.local'),
+                'timeout': int(os.getenv('GIT_TIMEOUT', 3600)),
+                'cleanup_temp': os.getenv('GIT_CLEANUP_TEMP', 'true').lower() == 'true',
+                'lfs_enabled': os.getenv('GIT_LFS_ENABLED', 'true').lower() == 'true',
+                'preserve_lfs': os.getenv('GIT_PRESERVE_LFS', 'true').lower() == 'true',
             },
             'logging': {
                 'level': os.getenv('LOG_LEVEL', 'INFO'),
@@ -212,6 +272,15 @@ class Config(BaseModel):
                 'max_workers': 5,
                 'timeout': 300,
                 'dry_run': False,
+            },
+            'git': {
+                'temp_dir': '/tmp/gitlab-migration',  # Custom temp directory (optional)
+                'user_name': 'GitLab Migration Tool',
+                'user_email': 'migration@gitlab.local',
+                'timeout': 3600,  # 1 hour timeout for git operations
+                'cleanup_temp': True,
+                'lfs_enabled': True,
+                'preserve_lfs': True,
             },
             'logging': {
                 'level': 'INFO',
