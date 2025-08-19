@@ -16,7 +16,7 @@ A high-performance, async-powered tool for migrating users, repositories, groups
 
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone https://github.com/ichuan/gitlab-migrate
 cd gitlab-migrate
 
 # Install dependencies
