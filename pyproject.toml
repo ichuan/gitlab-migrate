@@ -1,0 +1,51 @@
+[tool.poetry]
+name = "gitlab-migrate"
+version = "0.1.0"
+description = "Comprehensive GitLab migration tool for users, groups, projects, and repositories"
+authors = ["GitLab Migration Team"]
+readme = "README.md"
+packages = [{ include = "gitlab_migrate", from = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.9"
+requests = "^2.31.0"
+click = "^8.1.0"
+pydantic = "^2.5.0"
+rich = "^13.7.0"
+pyyaml = "^6.0.1"
+python-dotenv = "^1.0.0"
+loguru = "^0.7.2"
+aiohttp = "^3.9.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.0"
+pytest-asyncio = "^0.21.0"
+pytest-cov = "^4.1.0"
+black = "^23.12.0"
+flake8 = "^6.1.0"
+mypy = "^1.8.0"
+pre-commit = "^3.6.0"
+
+[tool.poetry.scripts]
+gitlab-migrate = "gitlab_migrate.cli:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 88
+target-version = ['py39']
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "--cov=src --cov-report=html --cov-report=term-missing"
