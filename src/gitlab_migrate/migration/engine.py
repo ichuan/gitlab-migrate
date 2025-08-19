@@ -25,13 +25,17 @@ class MigrationEngine:
         self.source_client = GitLabClientFactory.create_client(config.source)
         self.destination_client = GitLabClientFactory.create_client(config.destination)
 
-        # Create migration context
+        # Create migration context with performance batch size settings
         self.context = MigrationContext(
             source_client=self.source_client,
             destination_client=self.destination_client,
             dry_run=config.migration.dry_run,
             batch_size=config.migration.batch_size,
             max_workers=config.migration.max_workers,
+            user_batch_size=getattr(config.migration, 'user_batch_size', 20),
+            group_batch_size=getattr(config.migration, 'group_batch_size', 10),
+            project_batch_size=getattr(config.migration, 'project_batch_size', 10),
+            member_batch_size=getattr(config.migration, 'member_batch_size', 20),
         )
 
         # Initialize orchestrator with git config
@@ -113,7 +117,7 @@ class MigrationEngine:
             migrate_projects=self.config.migration.projects,
             migrate_repositories=self.config.migration.repositories,
             batch_size=self.config.migration.batch_size,
-            max_concurrent_batches=self.config.migration.max_workers,
+            max_concurrent_batches=5,  # Fixed value for orchestrator-level concurrency
         )
 
     async def _test_connectivity(self) -> None:

@@ -1,6 +1,7 @@
 """GitLab API client implementation."""
 
 import asyncio
+import json
 import time
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urljoin
@@ -17,7 +18,6 @@ from .exceptions import (
     GitLabNotFoundError,
     GitLabRateLimitError,
 )
-from .rate_limiter import RateLimiter
 
 
 class APIResponse(BaseModel):
@@ -30,7 +30,7 @@ class APIResponse(BaseModel):
 
 
 class GitLabClient:
-    """GitLab API client with authentication and rate limiting."""
+    """GitLab API client with authentication."""
 
     def __init__(self, config: GitLabInstanceConfig):
         """Initialize GitLab client.
@@ -41,9 +41,6 @@ class GitLabClient:
         self.config = config
         self.base_url = config.url.rstrip('/') + '/api/v4'
         self.session = requests.Session()
-        self.rate_limiter = RateLimiter(
-            requests_per_second=config.rate_limit_per_second
-        )
 
         # Set authentication headers
         if config.token:
@@ -152,10 +149,10 @@ class GitLabClient:
         """
         url = self._build_url(endpoint)
 
-        # Apply rate limiting
-        await self.rate_limiter.acquire()
-
-        headers = dict(self.session.headers)
+        headers = {
+            'Content-Type': 'application/json',
+            'User-Agent': 'gitlab-migrate/1.0.0',
+        }
         if self.config.token:
             headers['Private-Token'] = self.config.token
         elif self.config.oauth_token:
@@ -204,12 +201,13 @@ class GitLabClient:
 
                     # Parse response data
                     try:
-                        if response.content_length and response.content_length > 0:
-                            response_data = await response.json()
+                        response_text = await response.text()
+                        if response_text:
+                            response_data = json.loads(response_text)
                         else:
                             response_data = None
-                    except (ValueError, aiohttp.ContentTypeError):
-                        response_data = await response.text()
+                    except (ValueError, json.JSONDecodeError):
+                        response_data = response_text
 
                     return APIResponse(
                         status_code=response.status,
@@ -237,9 +235,6 @@ class GitLabClient:
         """
         url = self._build_url(endpoint)
 
-        # Apply rate limiting (synchronous)
-        time.sleep(1.0 / self.config.rate_limit_per_second)
-
         try:
             response = self.session.get(url, params=params, **kwargs)
             return self._handle_response(response)
@@ -261,9 +256,6 @@ class GitLabClient:
             API response
         """
         url = self._build_url(endpoint)
-
-        # Apply rate limiting (synchronous)
-        time.sleep(1.0 / self.config.rate_limit_per_second)
 
         try:
             response = self.session.post(url, json=data, **kwargs)
@@ -287,9 +279,6 @@ class GitLabClient:
         """
         url = self._build_url(endpoint)
 
-        # Apply rate limiting (synchronous)
-        time.sleep(1.0 / self.config.rate_limit_per_second)
-
         try:
             response = self.session.put(url, json=data, **kwargs)
             return self._handle_response(response)
@@ -308,9 +297,6 @@ class GitLabClient:
             API response
         """
         url = self._build_url(endpoint)
-
-        # Apply rate limiting (synchronous)
-        time.sleep(1.0 / self.config.rate_limit_per_second)
 
         try:
             response = self.session.delete(url, **kwargs)

@@ -1,6 +1,6 @@
 # GitLab Migration Tool
 
-A comprehensive tool for migrating users, repositories, groups, and projects from one GitLab instance to another using API-based migration approaches.
+A high-performance, async-powered tool for migrating users, repositories, groups, and projects from one GitLab instance to another using API-based migration approaches with concurrent processing capabilities.
 
 ## Features
 
@@ -8,6 +8,9 @@ A comprehensive tool for migrating users, repositories, groups, and projects fro
 - **Group Migration**: Preserve group hierarchies and permissions
 - **Project Migration**: Complete project data transfer with metadata preservation
 - **Repository Migration**: Full Git history preservation with all branches and tags
+- **Async Processing**: High-performance concurrent operations for faster migrations
+- **Rate Limiting**: Built-in rate limiting to respect GitLab API constraints
+- **Comprehensive Validation**: Pre-migration validation and post-migration verification
 
 ## Installation
 
@@ -29,12 +32,17 @@ poetry shell
 # Initialize configuration
 gitlab-migrate init
 
-# Run migration
+# Run migration with async processing
 gitlab-migrate migrate --config config.yaml
 
-# Validate migration
+# Validate migration results
 gitlab-migrate validate --config config.yaml
+
+# Monitor progress with detailed logging
+gitlab-migrate migrate --config config.yaml --log-level INFO
 ```
+
+For detailed setup instructions, configuration options, and troubleshooting, see the [User Guide](docs/user-guide.md).
 
 ## Configuration
 
@@ -58,10 +66,10 @@ migration:
 
 ## Documentation
 
-- [User Guide](docs/user-guide.md)
-- [Configuration Reference](docs/configuration.md)
-- [API Documentation](docs/api.md)
-- [Troubleshooting](docs/troubleshooting.md)
+- [User Guide](docs/user-guide.md) - Complete installation, configuration, and usage instructions
+- [Configuration Reference](docs/configuration.md) - Detailed configuration options and performance tuning
+- [API Documentation](docs/api.md) - Technical architecture and API reference
+- [Troubleshooting](docs/troubleshooting.md) - Common issues, solutions, and debugging tips
 
 ## Development
 

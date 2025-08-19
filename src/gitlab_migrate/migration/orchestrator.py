@@ -37,10 +37,10 @@ class MigrationPlan(BaseModel):
         description='Order of entity migration',
     )
 
-    # Batch settings
-    batch_size: int = Field(default=50, description='Batch size for processing')
+    # Batch settings - smaller batches for more concurrency
+    batch_size: int = Field(default=20, description='Batch size for processing')
     max_concurrent_batches: int = Field(
-        default=3, description='Maximum concurrent batches'
+        default=5, description='Maximum concurrent batches'
     )
 
 

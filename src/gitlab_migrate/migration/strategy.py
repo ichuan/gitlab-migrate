@@ -1,5 +1,6 @@
 """Migration strategy interfaces and implementations."""
 
+import asyncio
 import time
 import random
 import string
@@ -77,8 +78,18 @@ class MigrationContext(BaseModel):
 
     # Migration settings
     dry_run: bool = Field(default=False, description='Perform dry run without changes')
-    batch_size: int = Field(default=50, description='Batch size for processing')
-    max_workers: int = Field(default=5, description='Maximum concurrent workers')
+    batch_size: int = Field(default=5, description='Batch size for processing')
+    max_workers: int = Field(default=20, description='Maximum concurrent workers')
+
+    # Performance batch size settings
+    user_batch_size: int = Field(default=5, description='Concurrent users to process')
+    group_batch_size: int = Field(default=5, description='Concurrent groups to process')
+    project_batch_size: int = Field(
+        default=5, description='Concurrent projects to process'
+    )
+    member_batch_size: int = Field(
+        default=5, description='Concurrent members to process'
+    )
 
     # Mappings
     user_mappings: Dict[int, UserMapping] = Field(
@@ -192,6 +203,68 @@ class MigrationStrategy(ABC):
             **kwargs,
         )
 
+    async def _find_user(
+        self,
+        search_value: str,
+        search_type: str = 'email_or_username',
+        user_obj: Optional[User] = None,
+    ) -> Optional[User]:
+        """Find existing user in destination by various search criteria.
+
+        Args:
+            search_value: Value to search for (email, username, etc.)
+            search_type: Type of search ('email', 'username', 'email_or_username')
+            user_obj: Optional User object for email_or_username search
+
+        Returns:
+            Existing user if found, None otherwise
+        """
+        try:
+            if search_type == 'email_or_username' and user_obj:
+                # Search by email first
+                response = await self.context.destination_client.get_async(
+                    '/users', params={'search': user_obj.email}
+                )
+                if response.success and response.data:
+                    for user_data in response.data:
+                        if user_data.get('email') == user_obj.email:
+                            return User(**user_data)
+
+                # Search by username
+                response = await self.context.destination_client.get_async(
+                    '/users', params={'username': user_obj.username}
+                )
+                if response.success and response.data:
+                    for user_data in response.data:
+                        if user_data.get('username') == user_obj.username:
+                            return User(**user_data)
+
+            elif search_type == 'email':
+                response = await self.context.destination_client.get_async(
+                    '/users', params={'search': search_value}
+                )
+                if response.success and response.data:
+                    for user_data in response.data:
+                        if user_data.get('email') == search_value:
+                            return User(**user_data)
+
+            elif search_type == 'username':
+                response = await self.context.destination_client.get_async(
+                    '/users', params={'username': search_value}
+                )
+                if response.success and response.data:
+                    for user_data in response.data:
+                        if user_data.get('username') == search_value:
+                            return User(**user_data)
+
+            return None
+
+        except Exception as e:
+            self.logger.warning(
+                f'Error searching for user {search_value} ({search_type}): {e}'
+            )
+            return None
+
 
 class UserMigrationStrategy(MigrationStrategy):
     """Strategy for migrating users."""
@@ -273,7 +346,7 @@ class UserMigrationStrategy(MigrationStrategy):
             user_create_data['password'] = 'TempPassword123!'
             user_create_data['force_random_password'] = True
 
-            response = self.context.destination_client.post(
+            response = await self.context.destination_client.post_async(
                 '/users', data=user_create_data
             )
 
@@ -318,7 +391,7 @@ class UserMigrationStrategy(MigrationStrategy):
             )
 
     async def migrate_batch(self, users: List[User]) -> List[MigrationResult]:
-        """Migrate a batch of users.
+        """Migrate a batch of users concurrently.
 
         Args:
             users: List of users to migrate
@@ -326,11 +399,27 @@ class UserMigrationStrategy(MigrationStrategy):
         Returns:
             List of migration results
         """
-        results = []
-        for user in users:
-            result = await self.migrate_entity(user)
-            results.append(result)
-        return results
+        # Process all users concurrently without sub-batching
+        batch_tasks = [self.migrate_entity(user) for user in users]
+        batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+
+        all_results = []
+        # Handle results and exceptions
+        for result in batch_results:
+            if isinstance(result, Exception):
+                # Create a failed result for the exception
+                error_result = self.create_result(
+                    entity_type='user',
+                    entity_id='unknown',
+                    status=MigrationStatus.FAILED,
+                    success=False,
+                    error_message=str(result),
+                )
+                all_results.append(error_result)
+            else:
+                all_results.append(result)
+
+        return all_results
 
     async def validate_prerequisites(self) -> bool:
         """Validate prerequisites for user migration.
@@ -340,7 +429,7 @@ class UserMigrationStrategy(MigrationStrategy):
         """
         try:
             # Test destination client connectivity and permissions
-            response = self.context.destination_client.get('/user')
+            response = await self.context.destination_client.get_async('/user')
             if not response.success:
                 self.logger.error('Cannot connect to destination GitLab instance')
                 return False
@@ -367,32 +456,7 @@ class UserMigrationStrategy(MigrationStrategy):
         Returns:
             Existing user if found, None otherwise
         """
-        try:
-            # Search by email first
-            response = self.context.destination_client.get(
-                '/users', params={'search': user.email}
-            )
-            if response.success and response.data:
-                for user_data in response.data:
-                    if user_data.get('email') == user.email:
-                        return User(**user_data)
-
-            # Search by username
-            response = self.context.destination_client.get(
-                '/users', params={'username': user.username}
-            )
-            if response.success and response.data:
-                for user_data in response.data:
-                    if user_data.get('username') == user.username:
-                        return User(**user_data)
-
-            return None
-
-        except Exception as e:
-            self.logger.warning(
-                f'Error searching for existing user {user.username}: {e}'
-            )
-            return None
+        return await self._find_user('', 'email_or_username', user)
 
     def _should_skip_user(self, user: User) -> bool:
         """Check if user should be skipped (bot users, system users, etc.).
@@ -491,7 +555,7 @@ class GroupMigrationStrategy(MigrationStrategy):
                 parent_id=parent_id,
             )
 
-            response = self.context.destination_client.post(
+            response = await self.context.destination_client.post_async(
                 '/groups', data=group_create.dict(exclude_none=True)
             )
 
@@ -542,7 +606,7 @@ class GroupMigrationStrategy(MigrationStrategy):
             )
 
     async def migrate_batch(self, groups: List[Group]) -> List[MigrationResult]:
-        """Migrate a batch of groups.
+        """Migrate a batch of groups concurrently.
 
         Args:
             groups: List of groups to migrate
@@ -550,11 +614,27 @@ class GroupMigrationStrategy(MigrationStrategy):
         Returns:
             List of migration results
         """
-        results = []
-        for group in groups:
-            result = await self.migrate_entity(group)
-            results.append(result)
-        return results
+        # Process all groups concurrently without sub-batching
+        batch_tasks = [self.migrate_entity(group) for group in groups]
+        batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+
+        all_results = []
+        # Handle results and exceptions
+        for result in batch_results:
+            if isinstance(result, Exception):
+                # Create a failed result for the exception
+                error_result = self.create_result(
+                    entity_type='group',
+                    entity_id='unknown',
+                    status=MigrationStatus.FAILED,
+                    success=False,
+                    error_message=str(result),
+                )
+                all_results.append(error_result)
+            else:
+                all_results.append(result)
+
+        return all_results
 
     async def validate_prerequisites(self) -> bool:
         """Validate prerequisites for group migration.
@@ -564,7 +644,7 @@ class GroupMigrationStrategy(MigrationStrategy):
         """
         try:
             # Test destination client connectivity
-            response = self.context.destination_client.get('/groups')
+            response = await self.context.destination_client.get_async('/groups')
             return response.success
 
         except Exception as e:
@@ -581,7 +661,9 @@ class GroupMigrationStrategy(MigrationStrategy):
             Existing group if found, None otherwise
         """
         try:
-            response = self.context.destination_client.get(f'/groups/{group.path}')
+            response = await self.context.destination_client.get_async(
+                f'/groups/{group.path}'
+            )
             if response.success:
                 return Group(**response.data)
             return None
@@ -613,7 +695,7 @@ class GroupMigrationStrategy(MigrationStrategy):
     async def _migrate_group_members(
         self, source_group_id: int, destination_group_id: int
     ) -> int:
-        """Migrate group members from source to destination.
+        """Migrate group members from source to destination using batch processing.
 
         Args:
             source_group_id: Source group ID
@@ -622,8 +704,6 @@ class GroupMigrationStrategy(MigrationStrategy):
         Returns:
             Number of members successfully migrated
         """
-        members_migrated = 0
-
         try:
             # Get group members from source
             source_members = await self._get_group_members(source_group_id)
@@ -636,73 +716,116 @@ class GroupMigrationStrategy(MigrationStrategy):
                 f'Migrating {len(source_members)} members for group {source_group_id}'
             )
 
-            for member_data in source_members:
-                try:
-                    source_user_id = member_data.get('id')
-                    access_level = member_data.get('access_level')
-                    expires_at = member_data.get('expires_at')
+            # Process members in batches for better performance
+            batch_size = getattr(
+                self.context, 'member_batch_size', 20
+            )  # Use configurable batch size
+            members_migrated = 0
 
-                    if not source_user_id or not access_level:
-                        self.logger.warning(f'Invalid member data: {member_data}')
-                        continue
+            # Split members into batches
+            member_batches = [
+                source_members[i : i + batch_size]
+                for i in range(0, len(source_members), batch_size)
+            ]
 
-                    # Check if user was migrated
-                    if source_user_id not in self.context.migrated_users:
-                        self.logger.warning(
-                            f'User {source_user_id} ({member_data.get("username", "unknown")}) '
-                            f'not found in migrated users, skipping group membership'
-                        )
-                        continue
-
-                    destination_user_id = self.context.migrated_users[source_user_id]
-
-                    # Check if user is already a member of the destination group
-                    if await self._is_user_group_member(
-                        destination_group_id, destination_user_id
-                    ):
-                        self.logger.info(
-                            f'User {destination_user_id} is already a member of group {destination_group_id}'
-                        )
-                        members_migrated += 1
-                        continue
-
-                    # Add user to destination group
-                    member_add_data = {
-                        'user_id': destination_user_id,
-                        'access_level': access_level,
-                    }
-
-                    if expires_at:
-                        member_add_data['expires_at'] = expires_at
-
-                    response = self.context.destination_client.post(
-                        f'/groups/{destination_group_id}/members', data=member_add_data
+            for batch in member_batches:
+                # Process batch concurrently
+                batch_tasks = []
+                for member_data in batch:
+                    task = self._migrate_single_group_member(
+                        member_data, destination_group_id
                     )
+                    batch_tasks.append(task)
 
-                    if response.success:
+                # Wait for all members in batch to complete
+                batch_results = await asyncio.gather(
+                    *batch_tasks, return_exceptions=True
+                )
+
+                # Count successful migrations
+                for result in batch_results:
+                    if isinstance(result, bool) and result:
                         members_migrated += 1
-                        self.logger.info(
-                            f'Added user {destination_user_id} ({member_data.get("username", "unknown")}) '
-                            f'to group {destination_group_id} with access level {access_level}'
-                        )
-                    else:
-                        self.logger.warning(
-                            f'Failed to add user {destination_user_id} to group {destination_group_id}: '
-                            f'{response.data}'
-                        )
+                    elif isinstance(result, Exception):
+                        self.logger.error(f'Batch member migration error: {result}')
 
-                except Exception as e:
-                    self.logger.error(
-                        f'Error migrating group member {member_data}: {e}'
-                    )
-                    continue
+            return members_migrated
 
         except Exception as e:
             self.logger.error(
                 f'Error migrating members for group {source_group_id}: {e}'
             )
+            return 0
 
-        return members_migrated
+    async def _migrate_single_group_member(
+        self, member_data: Dict[str, Any], destination_group_id: int
+    ) -> bool:
+        """Migrate a single group member.
+
+        Args:
+            member_data: Member data from source
+            destination_group_id: Destination group ID
+
+        Returns:
+            True if migration was successful
+        """
+        try:
+            source_user_id = member_data.get('id')
+            access_level = member_data.get('access_level')
+            expires_at = member_data.get('expires_at')
+
+            if not source_user_id or not access_level:
+                self.logger.warning(f'Invalid member data: {member_data}')
+                return False
+
+            # Check if user was migrated
+            if source_user_id not in self.context.migrated_users:
+                self.logger.warning(
+                    f'User {source_user_id} ({member_data.get("username", "unknown")}) '
+                    f'not found in migrated users, skipping group membership'
+                )
+                return False
+
+            destination_user_id = self.context.migrated_users[source_user_id]
+
+            # Check if user is already a member of the destination group
+            if await self._is_user_group_member(
+                destination_group_id, destination_user_id
+            ):
+                self.logger.debug(
+                    f'User {destination_user_id} is already a member of group {destination_group_id}'
+                )
+                return True
+
+            # Add user to destination group
+            member_add_data = {
+                'user_id': destination_user_id,
+                'access_level': access_level,
+            }
+
+            if expires_at:
+                member_add_data['expires_at'] = expires_at
+
+            response = await self.context.destination_client.post_async(
+                f'/groups/{destination_group_id}/members', data=member_add_data
+            )
+
+            if response.success:
+                self.logger.debug(
+                    f'Added user {destination_user_id} ({member_data.get("username", "unknown")}) '
+                    f'to group {destination_group_id} with access level {access_level}'
+                )
+                return True
+            else:
+                self.logger.warning(
+                    f'Failed to add user {destination_user_id} to group {destination_group_id}: '
+                    f'{response.data}'
+                )
+                return False
+
+        except Exception as e:
+            self.logger.error(f'Error migrating group member {member_data}: {e}')
+            return False
 
     async def _is_user_group_member(self, group_id: int, user_id: int) -> bool:
         """Check if user is already a member of the group.
@@ -715,7 +838,7 @@ class GroupMigrationStrategy(MigrationStrategy):
             True if user is already a member
         """
         try:
-            response = self.context.destination_client.get(
+            response = await self.context.destination_client.get_async(
                 f'/groups/{group_id}/members/{user_id}'
             )
             return response.success
@@ -733,12 +856,14 @@ class GroupMigrationStrategy(MigrationStrategy):
         """
         try:
             # Try to get group by full path
-            response = self.context.destination_client.get(f'/groups/{group_path}')
+            response = await self.context.destination_client.get_async(
+                f'/groups/{group_path}'
+            )
             if response.success:
                 return Group(**response.data)
 
             # If not found by direct path, try searching
-            response = self.context.destination_client.get(
+            response = await self.context.destination_client.get_async(
                 '/groups', params={'search': group_path}
             )
             if response.success and response.data:
@@ -764,23 +889,7 @@ class GroupMigrationStrategy(MigrationStrategy):
         Returns:
             Existing user if found, None otherwise
         """
-        try:
-            # Search by username
-            response = self.context.destination_client.get(
-                '/users', params={'username': username}
-            )
-            if response.success and response.data:
-                for user_data in response.data:
-                    if user_data.get('username') == username:
-                        return User(**user_data)
-
-            return None
-
-        except Exception as e:
-            self.logger.warning(
-                f'Error searching for existing user by username {username}: {e}'
-            )
-            return None
+        return await self._find_user(username, 'username')
 
 
 class ProjectMigrationStrategy(MigrationStrategy):
@@ -885,7 +994,7 @@ class ProjectMigrationStrategy(MigrationStrategy):
                 snippets_enabled=project.snippets_enabled or True,
             )
 
-            response = self.context.destination_client.post(
+            response = await self.context.destination_client.post_async(
                 '/projects', data=project_create.dict(exclude_none=True)
             )
 
@@ -960,7 +1069,7 @@ class ProjectMigrationStrategy(MigrationStrategy):
             )
 
     async def migrate_batch(self, projects: List[Project]) -> List[MigrationResult]:
-        """Migrate a batch of projects.
+        """Migrate a batch of projects concurrently.
 
         Args:
             projects: List of projects to migrate
@@ -968,11 +1077,27 @@ class ProjectMigrationStrategy(MigrationStrategy):
         Returns:
             List of migration results
         """
-        results = []
-        for project in projects:
-            result = await self.migrate_entity(project)
-            results.append(result)
-        return results
+        # Process all projects concurrently without sub-batching
+        batch_tasks = [self.migrate_entity(project) for project in projects]
+        batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+
+        all_results = []
+        # Handle results and exceptions
+        for result in batch_results:
+            if isinstance(result, Exception):
+                # Create a failed result for the exception
+                error_result = self.create_result(
+                    entity_type='project',
+                    entity_id='unknown',
+                    status=MigrationStatus.FAILED,
+                    success=False,
+                    error_message=str(result),
+                )
+                all_results.append(error_result)
+            else:
+                all_results.append(result)
+
+        return all_results
 
     async def validate_prerequisites(self) -> bool:
         """Validate prerequisites for project migration.
@@ -982,7 +1107,7 @@ class ProjectMigrationStrategy(MigrationStrategy):
         """
         try:
             # Test destination client connectivity
-            response = self.context.destination_client.get('/projects')
+            response = await self.context.destination_client.get_async('/projects')
             return response.success
 
         except Exception as e:
@@ -1260,7 +1385,7 @@ class ProjectMigrationStrategy(MigrationStrategy):
     async def _migrate_project_members(
         self, source_project_id: int, destination_project_id: int
     ) -> int:
-        """Migrate project members from source to destination.
+        """Migrate project members from source to destination using batch processing.
 
         Args:
             source_project_id: Source project ID
@@ -1269,8 +1394,6 @@ class ProjectMigrationStrategy(MigrationStrategy):
         Returns:
             Number of members successfully migrated
         """
-        members_migrated = 0
-
         try:
             # Get project members from source
             source_members = await self._get_project_members(source_project_id)
@@ -1283,134 +1406,174 @@ class ProjectMigrationStrategy(MigrationStrategy):
                 f'Migrating {len(source_members)} members for project {source_project_id}'
             )
 
-            for member_data in source_members:
-                try:
-                    source_user_id = member_data.get('id')
-                    access_level = member_data.get('access_level')
-                    expires_at = member_data.get('expires_at')
+            # Process members in batches for better performance
+            batch_size = getattr(
+                self.context, 'member_batch_size', 20
+            )  # Use configurable batch size
+            members_migrated = 0
 
-                    if not source_user_id or not access_level:
-                        self.logger.warning(f'Invalid member data: {member_data}')
-                        continue
+            # Split members into batches
+            member_batches = [
+                source_members[i : i + batch_size]
+                for i in range(0, len(source_members), batch_size)
+            ]
 
-                    # Check if user was migrated
-                    if source_user_id not in self.context.migrated_users:
-                        self.logger.warning(
-                            f'User {source_user_id} ({member_data.get("username", "unknown")}) '
-                            f'not found in migrated users, skipping project membership'
-                        )
-                        continue
-
-                    destination_user_id = self.context.migrated_users[source_user_id]
-
-                    # Check if user is already a member of the destination project
-                    member_info = await self._get_user_project_member_info(
-                        destination_project_id, destination_user_id
+            for batch in member_batches:
+                # Process batch concurrently
+                batch_tasks = []
+                for member_data in batch:
+                    task = self._migrate_single_project_member(
+                        member_data, destination_project_id
                     )
-                    if member_info:
-                        current_access_level = member_info.get('access_level', 0)
-                        source_access_level = access_level
+                    batch_tasks.append(task)
 
-                        # Check if user has inherited permissions that are higher or equal
-                        if member_info.get('created_at') and member_info.get(
-                            'created_by'
-                        ):
-                            # This is an inherited membership, check if we need to update
-                            self.logger.info(
-                                f'User {destination_user_id} has inherited membership in project {destination_project_id} '
-                                f'with access level {current_access_level}'
-                            )
+                # Wait for all members in batch to complete
+                batch_results = await asyncio.gather(
+                    *batch_tasks, return_exceptions=True
+                )
 
-                            # Only attempt to update if the source access level is higher
-                            if source_access_level > current_access_level:
-                                # Try to update the access level
-                                update_response = self.context.destination_client.put(
-                                    f'/projects/{destination_project_id}/members/{destination_user_id}',
-                                    data={'access_level': source_access_level},
-                                )
-
-                                if update_response.success:
-                                    members_migrated += 1
-                                    self.logger.info(
-                                        f'Updated user {destination_user_id} access level from {current_access_level} to {source_access_level} '
-                                        f'in project {destination_project_id}'
-                                    )
-                                else:
-                                    self.logger.warning(
-                                        f'Failed to update user {destination_user_id} access level in project {destination_project_id}: '
-                                        f'{update_response.data}'
-                                    )
-                            else:
-                                self.logger.info(
-                                    f'User {destination_user_id} already has sufficient access level ({current_access_level}) '
-                                    f'in project {destination_project_id}, skipping update'
-                                )
-                                members_migrated += 1
-                        else:
-                            self.logger.info(
-                                f'User {destination_user_id} is already a member of project {destination_project_id} '
-                                f'with access level {current_access_level}'
-                            )
-                            members_migrated += 1
-                        continue
-
-                    # Add user to destination project
-                    member_add_data = {
-                        'user_id': destination_user_id,
-                        'access_level': access_level,
-                    }
-
-                    if expires_at:
-                        member_add_data['expires_at'] = expires_at
-
-                    response = self.context.destination_client.post(
-                        f'/projects/{destination_project_id}/members',
-                        data=member_add_data,
-                    )
-
-                    if response.success:
+                # Count successful migrations
+                for result in batch_results:
+                    if isinstance(result, bool) and result:
                         members_migrated += 1
-                        self.logger.info(
-                            f'Added user {destination_user_id} ({member_data.get("username", "unknown")}) '
-                            f'to project {destination_project_id} with access level {access_level}'
-                        )
-                    else:
-                        # Handle specific case of inherited permissions
-                        error_data = response.data
-                        if (
-                            isinstance(error_data, dict)
-                            and 'access_level' in error_data
-                        ):
-                            error_messages = error_data.get('access_level', [])
-                            if any(
-                                'greater than or equal to Maintainer inherited membership'
-                                in str(msg)
-                                for msg in error_messages
-                            ):
-                                self.logger.warning(
-                                    f'User {destination_user_id} has inherited permissions that prevent setting access level {access_level}. '
-                                    f'This is expected behavior when user has higher inherited permissions.'
-                                )
-                                members_migrated += 1  # Count as migrated since it's handled by inheritance
-                                continue
+                    elif isinstance(result, Exception):
+                        self.logger.error(f'Batch member migration error: {result}')
 
-                        self.logger.warning(
-                            f'Failed to add user {destination_user_id} to project {destination_project_id}: '
-                            f'{response.data}'
-                        )
-
-                except Exception as e:
-                    self.logger.error(
-                        f'Error migrating project member {member_data}: {e}'
-                    )
-                    continue
+            return members_migrated
 
         except Exception as e:
             self.logger.error(
                 f'Error migrating members for project {source_project_id}: {e}'
             )
+            return 0
 
-        return members_migrated
+    async def _migrate_single_project_member(
+        self, member_data: Dict[str, Any], destination_project_id: int
+    ) -> bool:
+        """Migrate a single project member.
+
+        Args:
+            member_data: Member data from source
+            destination_project_id: Destination project ID
+
+        Returns:
+            True if migration was successful
+        """
+        try:
+            source_user_id = member_data.get('id')
+            access_level = member_data.get('access_level')
+            expires_at = member_data.get('expires_at')
+
+            if not source_user_id or not access_level:
+                self.logger.warning(f'Invalid member data: {member_data}')
+                return False
+
+            # Check if user was migrated
+            if source_user_id not in self.context.migrated_users:
+                self.logger.warning(
+                    f'User {source_user_id} ({member_data.get("username", "unknown")}) '
+                    f'not found in migrated users, skipping project membership'
+                )
+                return False
+
+            destination_user_id = self.context.migrated_users[source_user_id]
+
+            # Check if user is already a member of the destination project
+            member_info = await self._get_user_project_member_info(
+                destination_project_id, destination_user_id
+            )
+            if member_info:
+                current_access_level = member_info.get('access_level', 0)
+                source_access_level = access_level
+
+                # Check if user has inherited permissions that are higher or equal
+                if member_info.get('created_at') and member_info.get('created_by'):
+                    # This is an inherited membership, check if we need to update
+                    self.logger.debug(
+                        f'User {destination_user_id} has inherited membership in project {destination_project_id} '
+                        f'with access level {current_access_level}'
+                    )
+
+                    # Only attempt to update if the source access level is higher
+                    if source_access_level > current_access_level:
+                        # Try to update the access level
+                        update_response = self.context.destination_client.put(
+                            f'/projects/{destination_project_id}/members/{destination_user_id}',
+                            data={'access_level': source_access_level},
+                        )
+
+                        if update_response.success:
+                            self.logger.debug(
+                                f'Updated user {destination_user_id} access level from {current_access_level} to {source_access_level} '
+                                f'in project {destination_project_id}'
+                            )
+                            return True
+                        else:
+                            self.logger.warning(
+                                f'Failed to update user {destination_user_id} access level in project {destination_project_id}: '
+                                f'{update_response.data}'
+                            )
+                            return False
+                    else:
+                        self.logger.debug(
+                            f'User {destination_user_id} already has sufficient access level ({current_access_level}) '
+                            f'in project {destination_project_id}, skipping update'
+                        )
+                        return True
+                else:
+                    self.logger.debug(
+                        f'User {destination_user_id} is already a member of project {destination_project_id} '
+                        f'with access level {current_access_level}'
+                    )
+                    return True
+
+            # Add user to destination project
+            member_add_data = {
+                'user_id': destination_user_id,
+                'access_level': access_level,
+            }
+
+            if expires_at:
+                member_add_data['expires_at'] = expires_at
+
+            response = self.context.destination_client.post(
+                f'/projects/{destination_project_id}/members',
+                data=member_add_data,
+            )
+
+            if response.success:
+                self.logger.debug(
+                    f'Added user {destination_user_id} ({member_data.get("username", "unknown")}) '
+                    f'to project {destination_project_id} with access level {access_level}'
+                )
+                return True
+            else:
+                # Handle specific case of inherited permissions
+                error_data = response.data
+                if isinstance(error_data, dict) and 'access_level' in error_data:
+                    error_messages = error_data.get('access_level', [])
+                    if any(
+                        'greater than or equal to Maintainer inherited membership'
+                        in str(msg)
+                        for msg in error_messages
+                    ):
+                        self.logger.warning(
+                            f'User {destination_user_id} has inherited permissions that prevent setting access level {access_level}. '
+                            f'This is expected behavior when user has higher inherited permissions.'
+                        )
+                        return (
+                            True  # Count as migrated since it's handled by inheritance
+                        )
+
+                self.logger.warning(
+                    f'Failed to add user {destination_user_id} to project {destination_project_id}: '
+                    f'{response.data}'
+                )
+                return False
+
+        except Exception as e:
+            self.logger.error(f'Error migrating project member {member_data}: {e}')
+            return False
 
     async def _is_user_project_member(self, project_id: int, user_id: int) -> bool:
         """Check if user is already a member of the project.

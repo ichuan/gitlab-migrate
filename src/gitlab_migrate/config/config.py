@@ -59,11 +59,23 @@ class MigrationConfig(BaseModel):
     projects: bool = Field(default=True, description='Migrate projects')
     repositories: bool = Field(default=True, description='Migrate repositories')
 
-    batch_size: int = Field(default=50, description='Batch size for processing')
-    max_workers: int = Field(default=5, description='Maximum concurrent workers')
+    batch_size: int = Field(default=100, description='Batch size for processing')
+    max_workers: int = Field(default=20, description='Maximum concurrent workers')
     timeout: int = Field(default=300, description='Operation timeout in seconds')
 
     dry_run: bool = Field(default=False, description='Perform dry run without changes')
+
+    # Performance tuning settings
+    user_batch_size: int = Field(default=50, description='Concurrent users to process')
+    group_batch_size: int = Field(
+        default=20, description='Concurrent groups to process'
+    )
+    project_batch_size: int = Field(
+        default=15, description='Concurrent projects to process'
+    )
+    member_batch_size: int = Field(
+        default=30, description='Concurrent members to process'
+    )
 
     @validator('batch_size')
     def validate_batch_size(cls, v):
@@ -77,6 +89,15 @@ class MigrationConfig(BaseModel):
         """Validate max workers is positive."""
         if v <= 0:
             raise ValueError('Max workers must be positive')
+        return v
+
+    @validator(
+        'user_batch_size', 'group_batch_size', 'project_batch_size', 'member_batch_size'
+    )
+    def validate_performance_batch_sizes(cls, v):
+        """Validate performance batch sizes are positive."""
+        if v <= 0:
+            raise ValueError('Performance batch sizes must be positive')
         return v
 
 
