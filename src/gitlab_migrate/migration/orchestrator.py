@@ -431,7 +431,6 @@ class MigrationOrchestrator:
         Returns:
             Migration summary (dry run results)
         """
-        # Set dry run mode
         original_dry_run = self.context.dry_run
         self.context.dry_run = True
 
@@ -439,5 +438,4 @@ class MigrationOrchestrator:
             self.logger.info('Starting migration dry run')
             return await self.execute_migration(plan)
         finally:
-            # Restore original dry run setting
             self.context.dry_run = original_dry_run

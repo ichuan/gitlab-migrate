@@ -343,18 +343,15 @@ class RepositoryMigrationResult(BaseModel):
     source_project_id: int = Field(..., description='Source project ID')
     destination_project_id: int = Field(..., description='Destination project ID')
 
-    # Migration details
     migration_method: str = Field(..., description='Migration method used')
     started_at: datetime = Field(..., description='Migration start time')
     completed_at: Optional[datetime] = Field(
         default=None, description='Migration completion time'
     )
 
-    # Results
     status: str = Field(..., description='Migration status')
     success: bool = Field(..., description='Migration was successful')
 
-    # Statistics
     branches_migrated: int = Field(default=0, description='Number of branches migrated')
     tags_migrated: int = Field(default=0, description='Number of tags migrated')
     commits_migrated: int = Field(default=0, description='Number of commits migrated')
@@ -362,17 +359,14 @@ class RepositoryMigrationResult(BaseModel):
         default=0, description='Number of LFS objects migrated'
     )
 
-    # Size information
     repository_size_bytes: Optional[int] = Field(
         default=None, description='Repository size in bytes'
     )
     lfs_size_bytes: Optional[int] = Field(default=None, description='LFS size in bytes')
 
-    # Error information
     errors: List[str] = Field(default_factory=list, description='Migration errors')
     warnings: List[str] = Field(default_factory=list, description='Migration warnings')
 
-    # Additional metadata
     notes: Optional[str] = Field(default=None, description='Additional notes')
 
     @validator('migration_method')

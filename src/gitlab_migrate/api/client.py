@@ -399,12 +399,10 @@ class GitLabClient:
 
             all_items.extend(items)
 
-            # Check if there are more pages
             total_pages = response.headers.get('X-Total-Pages')
             if total_pages and page >= int(total_pages):
                 break
 
-            # If no pagination headers, check if we got fewer items than requested
             if len(items) < per_page:
                 break
 

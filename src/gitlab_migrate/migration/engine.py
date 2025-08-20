@@ -128,11 +128,9 @@ class MigrationEngine:
         """
         self.logger.info('Testing connectivity to GitLab instances')
 
-        # Test source connectivity
         if not self.source_client.test_connection():
             raise ConnectionError('Cannot connect to source GitLab instance')
 
-        # Test destination connectivity
         if not self.destination_client.test_connection():
             raise ConnectionError('Cannot connect to destination GitLab instance')
 

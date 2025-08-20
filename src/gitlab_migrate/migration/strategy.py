@@ -543,8 +543,26 @@ class GroupMigrationStrategy(MigrationStrategy):
 
             # Resolve parent group if needed
             parent_id = None
-            if group.parent_id and group.parent_id in self.context.migrated_groups:
-                parent_id = self.context.migrated_groups[group.parent_id]
+            if group.parent_id:
+                if group.parent_id in self.context.migrated_groups:
+                    parent_id = self.context.migrated_groups[group.parent_id]
+                    self.logger.info(
+                        f'Found migrated parent group: {group.parent_id} -> {parent_id}'
+                    )
+                else:
+                    # Try to find parent group by path in destination
+                    parent_group = await self._find_parent_group_in_destination(group)
+                    if parent_group:
+                        parent_id = parent_group.id
+                        # Update the mapping for future use
+                        self.context.migrated_groups[group.parent_id] = parent_group.id
+                        self.logger.info(
+                            f'Found existing parent group in destination: {group.parent_id} -> {parent_id}'
+                        )
+                    else:
+                        self.logger.warning(
+                            f'Parent group {group.parent_id} not found for sub-group {group.path}. Creating as root-level group.'
+                        )
 
             # Create group in destination
             group_create = GroupCreate(
@@ -661,6 +679,17 @@ class GroupMigrationStrategy(MigrationStrategy):
             Existing group if found, None otherwise
         """
         try:
+            # First try to find by full path if available
+            if group.full_path:
+                # URL encode the full path to handle special characters and slashes
+                encoded_full_path = group.full_path.replace('/', '%2F')
+                response = await self.context.destination_client.get_async(
+                    f'/groups/{encoded_full_path}'
+                )
+                if response.success:
+                    return Group(**response.data)
+
+            # Then try by path only (for root-level groups)
             response = await self.context.destination_client.get_async(
                 f'/groups/{group.path}'
             )
@@ -855,9 +884,10 @@ class GroupMigrationStrategy(MigrationStrategy):
             Existing group if found, None otherwise
         """
         try:
-            # Try to get group by full path
+            # Try to get group by full path with proper URL encoding
+            encoded_group_path = group_path.replace('/', '%2F')
             response = await self.context.destination_client.get_async(
-                f'/groups/{group_path}'
+                f'/groups/{encoded_group_path}'
             )
             if response.success:
                 return Group(**response.data)
@@ -890,6 +920,63 @@ class GroupMigrationStrategy(MigrationStrategy):
             Existing user if found, None otherwise
         """
         return await self._find_user(username, 'username')
+
+    async def _find_parent_group_in_destination(self, group: Group) -> Optional[Group]:
+        """Find parent group in destination for a sub-group.
+
+        Args:
+            group: Sub-group whose parent we need to find
+
+        Returns:
+            Parent group if found, None otherwise
+        """
+        try:
+            if not group.parent_id:
+                return None
+
+            # Get parent group info from source to find it in destination
+            parent_response = self.context.source_client.get(
+                f'/groups/{group.parent_id}'
+            )
+            if not parent_response.success:
+                self.logger.warning(
+                    f'Could not get parent group {group.parent_id} from source'
+                )
+                return None
+
+            parent_group_data = parent_response.data
+            parent_path = parent_group_data.get('path')
+            parent_full_path = parent_group_data.get('full_path', parent_path)
+
+            if not parent_path:
+                self.logger.warning(f'Parent group {group.parent_id} has no path')
+                return None
+
+            # Try to find parent group in destination by full path first
+            if parent_full_path:
+                parent_group = await self._find_group_by_path(parent_full_path)
+                if parent_group:
+                    self.logger.info(
+                        f'Found parent group by full path: {parent_full_path} -> {parent_group.id}'
+                    )
+                    return parent_group
+
+            # Try to find by path only
+            parent_group = await self._find_group_by_path(parent_path)
+            if parent_group:
+                self.logger.info(
+                    f'Found parent group by path: {parent_path} -> {parent_group.id}'
+                )
+                return parent_group
+
+            self.logger.warning(
+                f'Parent group not found in destination: path={parent_path}, full_path={parent_full_path}'
+            )
+            return None
+
+        except Exception as e:
+            self.logger.error(f'Error finding parent group for {group.path}: {e}')
+            return None
 
 
 class ProjectMigrationStrategy(MigrationStrategy):
@@ -955,31 +1042,12 @@ class ProjectMigrationStrategy(MigrationStrategy):
                     warnings=[error_msg],
                 )
 
-            # Check if we need to generate a unique path to avoid disk conflicts
+            # Use original project path initially - only generate unique path if there's a conflict
             project_path = project.path
             project_name = project.name
 
-            # Only generate unique path if there's a conflict
-            if await self._path_exists_in_destination(project.path, project.namespace):
-                self.logger.info(
-                    f'Project path {project.path} exists, generating unique path'
-                )
-                project_path = await self._generate_unique_project_path(project)
-
-                # If path was changed, also update the project name to match
-                if project_path != project.path:
-                    # Extract the suffix from the unique path
-                    suffix = (
-                        project_path[len(project.path) + 1 :]
-                        if len(project_path) > len(project.path)
-                        else project_path.split('-')[-1]
-                    )
-                    project_name = f'{project.name}-{suffix}'
-                    self.logger.info(
-                        f'Generated unique project name: {project.name} -> {project_name}'
-                    )
-            else:
-                self.logger.info(f'Using original project path: {project.path}')
+            self.logger.info(f'Using original project path: {project_path}')
+            self.logger.info(f'Using original project name: {project_name}')
 
             project_create = ProjectCreate(
                 name=project_name,
@@ -994,55 +1062,128 @@ class ProjectMigrationStrategy(MigrationStrategy):
                 snippets_enabled=project.snippets_enabled or True,
             )
 
-            response = await self.context.destination_client.post_async(
-                '/projects', data=project_create.dict(exclude_none=True)
-            )
+            # Log the exact project creation request
+            project_data = project_create.dict(exclude_none=True)
+            self.logger.info(f'Creating project with data: {project_data}')
+            self.logger.info(f'Project creation API endpoint: POST /projects')
+            self.logger.info(f'Original project path: {project.path}')
+            self.logger.info(f'Generated unique path: {project_path}')
+            self.logger.info(f'Project name: {project_name}')
+            self.logger.info(f'Namespace ID: {namespace_id}')
 
-            if response.success:
-                new_project_data = response.data
-                new_project = Project(**new_project_data)
-                self.context.migrated_projects[project.id] = new_project.id
+            # Implement robust retry logic for disk conflicts
+            max_retries = 5
+            retry_count = 0
+            current_project_path = project_path
+            current_project_name = project_name
 
-                # Migrate project members after creating the project
-                members_migrated = await self._migrate_project_members(
-                    project.id, new_project.id
-                )
-
-                # Set the correct owner if different from namespace owner
-                await self._set_project_owner(project, new_project.id)
+            while retry_count <= max_retries:
+                # Update project data for current attempt
+                project_data = ProjectCreate(
+                    name=current_project_name,
+                    path=current_project_path,
+                    namespace_id=namespace_id,
+                    description=project.description,
+                    visibility=project.visibility,
+                    issues_enabled=project.issues_enabled or True,
+                    merge_requests_enabled=project.merge_requests_enabled or True,
+                    wiki_enabled=project.wiki_enabled or True,
+                    jobs_enabled=project.jobs_enabled or True,
+                    snippets_enabled=project.snippets_enabled or True,
+                ).dict(exclude_none=True)
 
                 self.logger.info(
-                    f'Successfully migrated project {project.path} -> ID {new_project.id} with {members_migrated} members'
+                    f'Attempt {retry_count + 1}/{max_retries + 1}: Creating project with path: {current_project_path}'
                 )
-                return self.create_result(
-                    entity_type='project',
-                    entity_id=str(project.id),
-                    status=MigrationStatus.COMPLETED,
-                    success=True,
-                    source_data=project.dict(),
-                    destination_data=new_project.dict(),
-                    metadata={'members_migrated': members_migrated},
+                self.logger.info(f'Project data being sent: {project_data}')
+
+                response = await self.context.destination_client.post_async(
+                    '/projects', data=project_data
                 )
-            else:
-                # Check for repository disk conflict error
-                if self._is_repository_disk_conflict(response.data):
-                    error_msg = f'Repository disk conflict for project {project.path}: {response.data}'
-                    self.logger.warning(
-                        f'Skipping project due to disk conflict: {project.path}'
+
+                self.logger.info(f'API Response - Success: {response.success}')
+                self.logger.info(f'API Response - Data: {response.data}')
+
+                if response.success:
+                    new_project_data = response.data
+                    new_project = Project(**new_project_data)
+                    self.context.migrated_projects[project.id] = new_project.id
+
+                    # Migrate project members after creating the project
+                    members_migrated = await self._migrate_project_members(
+                        project.id, new_project.id
                     )
+
+                    # Set the correct owner if different from namespace owner
+                    await self._set_project_owner(project, new_project.id)
+
+                    success_msg = f'Successfully migrated project {project.path}'
+                    if current_project_path != project.path:
+                        success_msg += f' -> {current_project_path}'
+                    success_msg += (
+                        f' (ID {new_project.id}) with {members_migrated} members'
+                    )
+                    if retry_count > 0:
+                        success_msg += f' after {retry_count} retries'
+
+                    self.logger.info(success_msg)
+
+                    metadata: Dict[str, Any] = {'members_migrated': members_migrated}
+                    if current_project_path != project.path:
+                        metadata['path_changed'] = True
+                        metadata['original_path'] = project.path
+                        metadata['final_path'] = current_project_path
+                        metadata['retries_needed'] = retry_count
+
                     return self.create_result(
                         entity_type='project',
                         entity_id=str(project.id),
-                        status=MigrationStatus.SKIPPED,
-                        success=True,  # Mark as success since we're intentionally skipping
+                        status=MigrationStatus.COMPLETED,
+                        success=True,
                         source_data=project.dict(),
-                        metadata={
-                            'reason': 'repository_disk_conflict',
-                            'skip_reason': 'disk_conflict',
-                        },
-                        warnings=[error_msg],
+                        destination_data=new_project.dict(),
+                        metadata=metadata,
                     )
+
+                # Check if this is a disk conflict that we can retry
+                elif self._is_repository_disk_conflict(response.data):
+                    retry_count += 1
+
+                    if retry_count <= max_retries:
+                        self.logger.warning(
+                            f'Repository disk conflict detected for project {project.path} (attempt {retry_count}/{max_retries + 1}), generating new unique path'
+                        )
+
+                        # Generate a new unique path for retry
+                        current_project_path = await self._generate_unique_project_path(
+                            project
+                        )
+                        # Keep the same name, only change path
+                        current_project_name = project_name
+
+                        # Add a small delay to avoid rapid retries
+                        await asyncio.sleep(0.1 * retry_count)  # Progressive delay
+                        continue
+                    else:
+                        # Max retries exceeded, but still mark as skipped rather than failed
+                        # since this is a server-side disk conflict issue, not a code bug
+                        error_msg = f'Repository disk conflict persists after {max_retries} retries for project {project.path}. Skipping to avoid blocking migration.'
+                        self.logger.error(error_msg)
+                        return self.create_result(
+                            entity_type='project',
+                            entity_id=str(project.id),
+                            status=MigrationStatus.SKIPPED,
+                            success=True,  # Mark as success since we're intentionally skipping
+                            source_data=project.dict(),
+                            metadata={
+                                'reason': 'persistent_disk_conflict',
+                                'retries_attempted': max_retries,
+                                'skip_reason': 'server_disk_conflict_unresolvable',
+                            },
+                            warnings=[error_msg],
+                        )
                 else:
+                    # Non-disk-conflict error, fail immediately
                     error_msg = (
                         f'Failed to create project {project.path}: {response.data}'
                     )
@@ -1055,6 +1196,18 @@ class ProjectMigrationStrategy(MigrationStrategy):
                         error_message=error_msg,
                         source_data=project.dict(),
                     )
+
+            # This should never be reached due to the logic above, but just in case
+            error_msg = f'Unexpected end of retry loop for project {project.path}'
+            self.logger.error(error_msg)
+            return self.create_result(
+                entity_type='project',
+                entity_id=str(project.id),
+                status=MigrationStatus.FAILED,
+                success=False,
+                error_message=error_msg,
+                source_data=project.dict(),
+            )
 
         except Exception as e:
             error_msg = f'Error migrating project {project.path}: {str(e)}'
@@ -1318,28 +1471,53 @@ class ProjectMigrationStrategy(MigrationStrategy):
             # Handle different error data formats
             error_str = str(error_data).lower()
 
+            self.logger.info(f'COLLISION DEBUG: Checking error data: {error_data}')
+            self.logger.info(f'COLLISION DEBUG: Error data type: {type(error_data)}')
+            self.logger.info(f'COLLISION DEBUG: Error string: {error_str}')
+
             # Handle structured error responses (dict format)
             if isinstance(error_data, dict):
+                self.logger.info(f'COLLISION DEBUG: Processing dict format error')
                 # Check for base errors
                 if 'base' in error_data and isinstance(error_data['base'], list):
                     for error_msg in error_data['base']:
-                        if 'repository' in str(error_msg).lower() and (
-                            'disk' in str(error_msg).lower()
-                            or 'already' in str(error_msg).lower()
-                        ):
+                        error_msg_str = str(error_msg).lower()
+                        if (
+                            'repository' in error_msg_str
+                            and (
+                                'disk' in error_msg_str
+                                or 'already' in error_msg_str
+                                or '已存在' in error_msg_str  # Chinese: already exists
+                                or '磁盘' in error_msg_str  # Chinese: disk
+                            )
+                        ) or 'uncaught throw :abort' in error_msg_str:
                             return True
 
                 # Check for path errors
                 if 'path' in error_data and isinstance(error_data['path'], list):
                     for error_msg in error_data['path']:
+                        error_msg_str = str(error_msg).lower()
                         if (
-                            'taken' in str(error_msg).lower()
-                            or 'already' in str(error_msg).lower()
+                            'taken' in error_msg_str
+                            or 'already' in error_msg_str
+                            or '已存在' in error_msg_str  # Chinese: already exists
+                        ):
+                            return True
+
+                # Check for name errors
+                if 'name' in error_data and isinstance(error_data['name'], list):
+                    for error_msg in error_data['name']:
+                        error_msg_str = str(error_msg).lower()
+                        if (
+                            'taken' in error_msg_str
+                            or 'already' in error_msg_str
+                            or '已存在' in error_msg_str  # Chinese: already exists
                         ):
                             return True
 
             # Check for common disk conflict error patterns in string format
             disk_conflict_patterns = [
+                # English patterns
                 'there is already a repository with that name on disk',
                 'repository with that name on disk',
                 'uncaught throw :abort',
@@ -1353,6 +1531,15 @@ class ProjectMigrationStrategy(MigrationStrategy):
                 'name can contain only',
                 'name is too long',
                 'invalid path',
+                'already exists',
+                'already taken',
+                # Chinese patterns
+                '磁盘上已存在具有该名称的仓库',  # Repository with that name already exists on disk
+                '磁盘上已存在',  # Already exists on disk
+                '仓库已存在',  # Repository already exists
+                '名称已被占用',  # Name already taken
+                '路径已存在',  # Path already exists
+                '已存在具有该名称',  # Already exists with that name
             ]
 
             return any(pattern in error_str for pattern in disk_conflict_patterns)
@@ -1705,60 +1892,35 @@ class ProjectMigrationStrategy(MigrationStrategy):
     async def _generate_unique_project_path(self, project: Project) -> str:
         """Generate a unique project path to avoid repository disk conflicts.
 
-        Only generates a unique path when necessary to avoid disk conflicts.
+        Always generates a unique path to proactively avoid disk conflicts,
+        since GitLab can have repository disk conflicts even when projects
+        don't exist in the API.
 
         Args:
             project: Source project
 
         Returns:
-            Project path (potentially unique) for destination
+            Unique project path for destination
         """
         try:
             original_path = project.path
+            
+            # Generate a highly random path to guarantee uniqueness
+            random_part = ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
+            unique_path = f"{original_path}-migrated-{random_part}"
 
-            # First check if the original path already exists
-            if not await self._path_exists_in_destination(
-                original_path, project.namespace
-            ):
-                # Path doesn't exist, use original path
-                self.logger.info(
-                    f'Using original project path (no conflict): {original_path}'
-                )
-                return original_path
-
-            # Path exists, generate a unique suffix to avoid disk conflicts
-            # GitLab disk conflicts can happen even when projects don't exist in API
-            max_attempts = 10
-            for attempt in range(max_attempts):
-                timestamp = int(time.time() % 10000)  # Last 4 digits of timestamp
-                random_suffix = ''.join(random.choices(string.ascii_lowercase, k=4))
-                unique_suffix = f'{timestamp}{random_suffix}'
-                unique_path = f'{original_path}-{unique_suffix}'
-
-                # Check if the generated unique path also exists (should be rare but possible)
-                if not await self._path_exists_in_destination(
-                    unique_path, project.namespace
-                ):
-                    self.logger.info(
-                        f'Generated unique project path to avoid disk conflicts: {original_path} -> {unique_path}'
-                    )
-                    return unique_path
-
-            # If we couldn't generate a unique path after max attempts, use timestamp + attempt
-            timestamp_full = int(time.time())
-            fallback_path = f'{original_path}-{timestamp_full}'
-            self.logger.warning(
-                f'Using fallback unique path after {max_attempts} attempts: {original_path} -> {fallback_path}'
+            self.logger.info(
+                f"Generated unique project path to proactively avoid disk conflicts: {original_path} -> {unique_path}"
             )
-            return fallback_path
+            return unique_path
 
         except Exception as e:
             self.logger.error(
-                f'CRITICAL ERROR: Failed to generate unique project path for {project.path}: {e}'
+                f"CRITICAL ERROR: Failed to generate unique project path for {project.path}: {e}"
             )
-            # Fallback to timestamp-based path
-            timestamp = int(time.time())
-            fallback_path = f'{project.path}-{timestamp}'
+            # Fallback to a simpler random path
+            random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+            fallback_path = f"{project.path}-{random_suffix}"
             return fallback_path
 
     async def _path_exists_in_destination(
@@ -1816,12 +1978,10 @@ class ProjectMigrationStrategy(MigrationStrategy):
             Existing group if found, None otherwise
         """
         try:
-            # Try to get group by full path
             response = self.context.destination_client.get(f'/groups/{group_path}')
             if response.success:
                 return Group(**response.data)
 
-            # If not found by direct path, try searching
             response = self.context.destination_client.get(
                 '/groups', params={'search': group_path}
             )

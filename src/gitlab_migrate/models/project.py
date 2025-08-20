@@ -326,7 +326,7 @@ class ProjectMemberAdd(BaseModel):
             30,
             40,
             50,
-        ]  # Guest, Reporter, Developer, Maintainer, Owner
+        ]
         if v not in valid_levels:
             raise ValueError(f'Access level must be one of: {valid_levels}')
         return v

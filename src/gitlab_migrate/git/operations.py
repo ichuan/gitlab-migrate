@@ -429,14 +429,8 @@ class GitOperations:
             destination_project_id: Destination project ID to clean up
         """
         try:
-            # Clean up temporary directory
             if temp_repo_path:
                 await self._cleanup_temp_directory(temp_repo_path)
-
-            # Note: We don't delete the destination project here because:
-            # 1. The project creation might have succeeded even if repo migration failed
-            # 2. The user might want to retry just the repository part
-            # 3. Deleting projects requires careful consideration of dependencies
 
             self.logger.info(
                 f'Cleaned up failed migration artifacts for project {destination_project_id}'

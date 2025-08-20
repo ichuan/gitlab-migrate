@@ -429,6 +429,54 @@ Error: Failed to create group 'groupname': Path has already been taken
    - Consider path mapping strategy
    - Use unique path generation
 
+### Issue: "Subgroup migration loses parent path"
+
+**Symptoms:**
+
+```
+Error: Subgroup 'enterpriseprojects/shiyao' becomes just 'shiyao'
+Error: Parent group information lost during migration
+Error: Subgroups created as root-level groups
+```
+
+**Solutions:**
+
+1. **Automatic fix (v1.1.0+):**
+
+   - The tool now automatically handles subgroup paths correctly
+   - URL encoding is applied to preserve full paths like `enterpriseprojects/shiyao`
+   - No configuration changes needed
+
+2. **Verify subgroup migration:**
+
+   ```bash
+   # Check migration logs for subgroup handling
+   grep -i "subgroup\|parent.*group" migration.log
+   grep -i "full_path" migration.log
+   ```
+
+3. **Manual verification:**
+
+   ```bash
+   # Verify parent groups exist in destination
+   curl -H "Private-Token: your-token" \
+        "https://destination.gitlab.com/api/v4/groups/enterpriseprojects%2Fshiyao"
+   ```
+
+4. **Migration order:**
+   - Parent groups are migrated before subgroups
+   - Tool maintains proper hierarchy during migration
+   - Check that parent groups completed successfully
+
+**Technical Details:**
+
+The issue was caused by improper URL encoding of subgroup paths in GitLab API calls:
+
+- **Before fix:** `/groups/enterpriseprojects/shiyao` (interpreted as separate path segments)
+- **After fix:** `/groups/enterpriseprojects%2Fshiyao` (properly encoded full path)
+
+This ensures that GitLab API correctly identifies the subgroup and maintains the parent-child relationship.
+
 ### Issue: "Project creation failed"
 
 **Symptoms:**
@@ -538,6 +586,49 @@ Error: batch_size must be greater than 0
    - Don't rely on environment variables
 
 ## Git Repository Issues
+
+### Issue: "Repository disk conflicts"
+
+**Symptoms:**
+
+```
+Error: 磁盘上已存在具有该名称的仓库 (Repository with that name already exists on disk)
+Error: There is already a repository with that name on disk
+Error: uncaught throw :abort
+```
+
+**Solutions:**
+
+1. **Automatic unique path generation:**
+
+   - The tool automatically generates unique project paths to avoid conflicts
+   - Projects are created with suffixes like `project-name-12345-abc123`
+   - This is the default behavior and requires no configuration
+
+2. **Check migration logs:**
+
+   ```bash
+   grep -i "disk conflict" migration.log
+   grep -i "unique project path" migration.log
+   ```
+
+3. **Manual cleanup (if needed):**
+
+   ```bash
+   # On GitLab server (admin access required)
+   sudo gitlab-rake gitlab:cleanup:repos
+   ```
+
+4. **Verify disk space:**
+   ```bash
+   df -h /var/opt/gitlab/git-data/repositories
+   ```
+
+**Note:** This issue commonly occurs when:
+
+- Previous migration attempts left repository files on disk
+- GitLab has orphaned repository directories
+- Multiple migrations target the same GitLab instance
 
 ### Issue: "Git LFS objects not migrated"
 

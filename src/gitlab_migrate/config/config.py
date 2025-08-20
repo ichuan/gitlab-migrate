@@ -295,10 +295,10 @@ class Config(BaseModel):
                 'dry_run': False,
             },
             'git': {
-                'temp_dir': '/tmp/gitlab-migration',  # Custom temp directory (optional)
+                'temp_dir': '/tmp/gitlab-migration',
                 'user_name': 'GitLab Migration Tool',
                 'user_email': 'migration@gitlab.local',
-                'timeout': 3600,  # 1 hour timeout for git operations
+                'timeout': 3600,
                 'cleanup_temp': True,
                 'lfs_enabled': True,
                 'preserve_lfs': True,

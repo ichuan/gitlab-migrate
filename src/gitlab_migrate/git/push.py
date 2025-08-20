@@ -167,26 +167,37 @@ class GitPusher:
             return False
 
     async def _push_all_refs(self, repo_path: str) -> bool:
-        """Push all branches and tags to destination.
-
-        Args:
-            repo_path: Path to git repository
-
-        Returns:
-            True if successful
-        """
+        """Push all branches, tags, and LFS objects to destination."""
         try:
+            # Push LFS objects if enabled
+            if self.config.lfs_enabled:
+                self.logger.info(f"Pushing LFS objects to destination...")
+                lfs_success = await self._run_git_command_with_timeout(
+                    ['git', 'lfs', 'push', '--all', 'destination'], repo_path
+                )
+                if not lfs_success:
+                    self.logger.error("Failed to push LFS objects.")
+                    return False
+
             # Push all branches
+            self.logger.info(f"Pushing all branches to destination...")
             branches_success = await self._run_git_command_with_timeout(
                 ['git', 'push', 'destination', '--all'], repo_path
             )
+            if not branches_success:
+                self.logger.error("Failed to push branches.")
+                return False
 
             # Push all tags
+            self.logger.info(f"Pushing all tags to destination...")
             tags_success = await self._run_git_command_with_timeout(
                 ['git', 'push', 'destination', '--tags'], repo_path
             )
+            if not tags_success:
+                self.logger.error("Failed to push tags.")
+                return False
 
-            return branches_success and tags_success
+            return True
 
         except Exception as e:
             self.logger.error(f'Failed to push all refs: {e}')
@@ -259,6 +270,7 @@ class GitPusher:
         Returns:
             True if successful
         """
+        self.logger.info(f'_run_git_command_with_timeout({cmd=},{work_dir=})')
         try:
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -322,13 +334,11 @@ class GitPusher:
         stats = {'branches': 0, 'tags': 0}
 
         try:
-            # Find the actual git repository directory (now has dynamic name)
             repo_git_path = self._find_git_repo_path(repo_path)
 
             if not repo_git_path or not os.path.exists(repo_git_path):
                 return stats
 
-            # Get branch count
             branches_result = await self._run_git_command_with_output(
                 ['git', 'branch', '-r'], repo_git_path
             )
@@ -337,7 +347,6 @@ class GitPusher:
                     [line for line in branches_result.split('\n') if line.strip()]
                 )
 
-            # Get tag count
             tags_result = await self._run_git_command_with_output(
                 ['git', 'tag'], repo_git_path
             )

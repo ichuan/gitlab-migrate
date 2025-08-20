@@ -326,7 +326,6 @@ async def _run_migration_with_progress(
 
 def _display_migration_summary(summary) -> None:
     """Display migration summary results."""
-    # Create summary table
     table = Table(title='Migration Summary')
     table.add_column('Entity Type', style='cyan')
     table.add_column('Total', style='blue')
@@ -334,7 +333,6 @@ def _display_migration_summary(summary) -> None:
     table.add_column('Failed', style='red')
     table.add_column('Skipped', style='yellow')
 
-    # Add rows for each entity type from the actual summary
     if hasattr(summary, 'results_by_type') and summary.results_by_type:
         for entity_type, counts in summary.results_by_type.items():
             table.add_row(
@@ -345,7 +343,6 @@ def _display_migration_summary(summary) -> None:
                 str(counts.get('skipped', 0)),
             )
     else:
-        # Fallback if no detailed results available
         table.add_row(
             'Total',
             str(getattr(summary, 'total_entities', 0)),
@@ -356,7 +353,6 @@ def _display_migration_summary(summary) -> None:
 
     console.print(table)
 
-    # Display timing information if available
     if (
         hasattr(summary, 'started_at')
         and hasattr(summary, 'completed_at')
@@ -365,7 +361,6 @@ def _display_migration_summary(summary) -> None:
         duration = summary.completed_at - summary.started_at
         console.print(f'\n[blue]Migration Duration:[/blue] {duration}')
 
-    # Display any warnings or errors
     if hasattr(summary, 'all_results'):
         warnings = []
         errors = []
@@ -379,14 +374,14 @@ def _display_migration_summary(summary) -> None:
 
         if warnings:
             console.print(f'\n[yellow]Warnings ({len(warnings)}):[/yellow]')
-            for warning in warnings[:5]:  # Show first 5 warnings
+            for warning in warnings[:5]:
                 console.print(f'  • {warning}')
             if len(warnings) > 5:
                 console.print(f'  ... and {len(warnings) - 5} more warnings')
 
         if errors:
             console.print(f'\n[red]Errors ({len(errors)}):[/red]')
-            for error in errors[:5]:  # Show first 5 errors
+            for error in errors[:5]:
                 console.print(f'  • {error}')
             if len(errors) > 5:
                 console.print(f'  ... and {len(errors) - 5} more errors')

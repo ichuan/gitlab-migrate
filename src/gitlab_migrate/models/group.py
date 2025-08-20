@@ -356,5 +356,4 @@ class GroupHierarchy(BaseModel):
         return None
 
 
-# Update forward references
 GroupHierarchy.model_rebuild()

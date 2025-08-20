@@ -22,7 +22,6 @@ def setup_logging(
     # Remove default handler
     logger.remove()
 
-    # Default format if not provided
     if log_format is None:
         log_format = (
             '<green>{time:YYYY-MM-DD HH:mm:ss}</green> | '
@@ -31,7 +30,6 @@ def setup_logging(
             '<level>{message}</level>'
         )
 
-    # Add console handler
     logger.add(
         sys.stderr,
         format=log_format,
@@ -41,12 +39,10 @@ def setup_logging(
         diagnose=True,
     )
 
-    # Add file handler if specified
     if log_file:
         log_path = Path(log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # File format (no colors)
         file_format = (
             '{time:YYYY-MM-DD HH:mm:ss} | '
             '{level: <8} | '

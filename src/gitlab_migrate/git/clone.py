@@ -137,6 +137,7 @@ class GitCloner:
         try:
             # Ensure destination directory exists
             os.makedirs(destination_path, exist_ok=True)
+            self.logger.info(f'Created destination directory: {destination_path}')
 
             # Generate unique repository directory name using timestamp and random suffix
             import time
@@ -149,6 +150,8 @@ class GitCloner:
             )
             repo_dir_name = f'repo_{timestamp}_{random_suffix}.git'
             repo_path = os.path.join(destination_path, repo_dir_name)
+
+            self.logger.info(f'Generated unique repository path: {repo_path}')
 
             # Double-check that the path doesn't exist (extremely unlikely but safe)
             if os.path.exists(repo_path):
@@ -169,6 +172,26 @@ class GitCloner:
                 repo_path,
             ]
 
+            # Log the exact git command being executed (mask sensitive token)
+            masked_cmd = cmd.copy()
+            if len(masked_cmd) >= 4 and 'oauth2:' in masked_cmd[3]:
+                # Mask the token in the URL for logging
+                masked_url = masked_cmd[3]
+                if '@' in masked_url:
+                    parts = masked_url.split('@')
+                    if len(parts) >= 2:
+                        auth_part = parts[0]
+                        if 'oauth2:' in auth_part:
+                            masked_auth = (
+                                auth_part.split('oauth2:')[0] + 'oauth2:***TOKEN***'
+                            )
+                            masked_url = masked_auth + '@' + '@'.join(parts[1:])
+                            masked_cmd[3] = masked_url
+
+            self.logger.info(f'Executing git command: {" ".join(masked_cmd)}')
+            self.logger.info(f'Working directory: {destination_path}')
+            self.logger.info(f'Target repository path: {repo_path}')
+
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -180,18 +203,48 @@ class GitCloner:
                 process.communicate(), timeout=self.config.timeout
             )
 
+            stdout_text = stdout.decode() if stdout else ''
+            stderr_text = stderr.decode() if stderr else ''
+
+            self.logger.info(f'Git command return code: {process.returncode}')
+            if stdout_text:
+                self.logger.info(f'Git stdout: {stdout_text}')
+            if stderr_text:
+                self.logger.info(f'Git stderr: {stderr_text}')
+
             if process.returncode == 0:
                 self.logger.info(f'Git clone completed successfully to {repo_path}')
+
+                # Fetch LFS objects if enabled
+                if self.config.lfs_enabled:
+                    self.logger.info(f'Fetching LFS objects for {repo_path}...')
+                    lfs_fetch_cmd = ['git', 'lfs', 'fetch', '--all']
+                    lfs_fetch_success = await self._run_git_command(
+                        lfs_fetch_cmd, repo_path
+                    )
+                    if not lfs_fetch_success:
+                        self.logger.warning(
+                            f'Git LFS fetch failed for {repo_path}. LFS objects may be missing.'
+                        )
                 return True
             else:
-                error_output = stderr.decode() if stderr else 'Unknown error'
-                self.logger.error(f'Git clone failed: {error_output}')
+                error_output = stderr_text if stderr_text else 'Unknown error'
+                self.logger.error(
+                    f'Git clone failed with return code {process.returncode}: {error_output}'
+                )
 
-                # Check if it's the "already exists" error and provide helpful message
+                # Check for various error patterns
                 if 'already exists' in error_output.lower():
                     self.logger.error(
                         f'Repository already exists at {repo_path}. This might indicate a cleanup issue. '
                         'Consider using a different temp_dir or ensuring proper cleanup.'
+                    )
+
+                # Check for Chinese error patterns
+                if '磁盘上已存在' in error_output or '仓库已存在' in error_output:
+                    self.logger.error(
+                        f'Chinese disk conflict error detected: {error_output}. '
+                        f'This suggests GitLab server-side disk conflict, not local path conflict.'
                     )
 
                 return False
@@ -212,21 +265,38 @@ class GitCloner:
             work_dir: Working directory for git operations
         """
         try:
+            self.logger.info(f'Configuring git in directory: {work_dir}')
+
             # Set git user configuration
-            await self._run_git_command(
-                ['git', 'config', '--global', 'user.name', self.config.user_name],
-                work_dir,
+            user_name_cmd = [
+                'git',
+                'config',
+                '--global',
+                'user.name',
+                self.config.user_name,
+            ]
+            self.logger.info(f'Executing git config command: {" ".join(user_name_cmd)}')
+            await self._run_git_command(user_name_cmd, work_dir)
+
+            user_email_cmd = [
+                'git',
+                'config',
+                '--global',
+                'user.email',
+                self.config.user_email,
+            ]
+            self.logger.info(
+                f'Executing git config command: {" ".join(user_email_cmd)}'
             )
-            await self._run_git_command(
-                ['git', 'config', '--global', 'user.email', self.config.user_email],
-                work_dir,
-            )
+            await self._run_git_command(user_email_cmd, work_dir)
 
             # Disable SSL verification if needed (for self-signed certificates)
             # This should be configurable in production
-            await self._run_git_command(
-                ['git', 'config', '--global', 'http.sslVerify', 'false'], work_dir
-            )
+            ssl_cmd = ['git', 'config', '--global', 'http.sslVerify', 'false']
+            self.logger.info(f'Executing git config command: {" ".join(ssl_cmd)}')
+            await self._run_git_command(ssl_cmd, work_dir)
+
+            self.logger.info('Git configuration completed successfully')
 
         except Exception as e:
             self.logger.warning(f'Git configuration failed: {e}')
@@ -242,6 +312,8 @@ class GitCloner:
             True if successful
         """
         try:
+            self.logger.debug(f'Running git command: {" ".join(cmd)} in {work_dir}')
+
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -249,10 +321,21 @@ class GitCloner:
                 cwd=work_dir,
             )
 
-            await process.communicate()
+            stdout, stderr = await process.communicate()
+
+            stdout_text = stdout.decode() if stdout else ''
+            stderr_text = stderr.decode() if stderr else ''
+
+            self.logger.debug(f'Git command return code: {process.returncode}')
+            if stdout_text:
+                self.logger.debug(f'Git command stdout: {stdout_text}')
+            if stderr_text:
+                self.logger.debug(f'Git command stderr: {stderr_text}')
+
             return process.returncode == 0
 
-        except Exception:
+        except Exception as e:
+            self.logger.error(f'Git command execution failed: {e}')
             return False
 
     async def _get_repository_stats(self, repo_path: str) -> dict:
@@ -267,16 +350,13 @@ class GitCloner:
         stats = {'size': 0, 'branches': 0, 'tags': 0, 'commits': 0}
 
         try:
-            # Find the actual git repository directory (now has dynamic name)
             repo_git_path = self._find_git_repo_path(repo_path)
 
             if not repo_git_path or not os.path.exists(repo_git_path):
                 return stats
 
-            # Get repository size
             stats['size'] = await self._get_directory_size(repo_git_path)
 
-            # Get branch count
             branches_result = await self._run_git_command_with_output(
                 ['git', 'branch', '-r'], repo_git_path
             )
@@ -285,7 +365,6 @@ class GitCloner:
                     [line for line in branches_result.split('\n') if line.strip()]
                 )
 
-            # Get tag count
             tags_result = await self._run_git_command_with_output(
                 ['git', 'tag'], repo_git_path
             )
@@ -294,7 +373,6 @@ class GitCloner:
                     [line for line in tags_result.split('\n') if line.strip()]
                 )
 
-            # Get commit count (approximate)
             commits_result = await self._run_git_command_with_output(
                 ['git', 'rev-list', '--all', '--count'], repo_git_path
             )

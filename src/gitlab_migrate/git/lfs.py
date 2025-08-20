@@ -381,13 +381,11 @@ class LFSHandler:
         }
 
         try:
-            # Check LFS availability
             info['lfs_available'] = await self._check_lfs_availability()
 
             if not info['lfs_available']:
                 return info
 
-            # Check if LFS is enabled (has .gitattributes with LFS patterns)
             gitattributes_path = os.path.join(repo_path, '.gitattributes')
             if os.path.exists(gitattributes_path):
                 with open(gitattributes_path, 'r') as f:
@@ -395,7 +393,6 @@ class LFSHandler:
                     if 'filter=lfs' in content:
                         info['lfs_enabled'] = True
 
-            # Get tracked patterns
             if info['lfs_enabled']:
                 patterns_result = await self._run_git_lfs_command_with_output(
                     ['git', 'lfs', 'track'], repo_path
@@ -407,7 +404,6 @@ class LFSHandler:
                         if line.strip() and not line.startswith('Listing')
                     ]
 
-            # Get LFS objects
             lfs_objects = await self._get_lfs_objects(repo_path)
             info['object_count'] = len(lfs_objects)
             info['total_size'] = await self._calculate_lfs_size(lfs_objects)
